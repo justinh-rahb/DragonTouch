@@ -10,6 +10,7 @@ This repository is deliberately groundwork only. It currently provides:
 - an ESP-IDF 5.3 / ESP32-S3 build skeleton;
 - a clean-room hardware contract derived from publicly documented behavior;
 - a compile-time pin-collision guard for the known RGB and GT911 signals;
+- a native LVGL printer-console shell using the Dragon design language and red accent;
 - bring-up gates that prevent us from jumping straight to product UI;
 - CI that compiles the scaffold for ESP32-S3.
 
@@ -32,9 +33,13 @@ See [docs/HARDWARE.md](docs/HARDWARE.md) before changing any display timing or p
 2. Prove serial, flash, PSRAM, and a black-screen/backlight-safe boot.
 3. Prove stable RGB output under simultaneous Wi-Fi traffic.
 4. Prove GT911 touch coordinates and orientation.
-5. Add LVGL and a board-level HIL pattern.
+5. Connect the LVGL shell to the board display and a board-level HIL pattern.
 6. Integrate `dragon-core` Wi-Fi, discovery, and remote-device contracts.
 7. Build the same-LAN Dragon-family single-pane UI.
+
+The LVGL shell is documented in [docs/UI.md](docs/UI.md). It compiles independently
+of the unfinished display driver and keeps all machine-affecting controls disabled
+until a capability-aware product adapter is connected.
 
 ## Reference boundary
 

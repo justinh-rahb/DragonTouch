@@ -28,7 +28,8 @@ client and coordinator, never the sole safety controller.
 
 - Native ESP-IDF first; no Arduino compatibility layer unless a measured blocker
   justifies it.
-- Board bring-up precedes LVGL styling or product adapters.
+- LVGL shell development may proceed against a simulator or unbound display contract;
+  board integration and enabled machine controls still follow hardware bring-up.
 - Prefer HTTP plus SSE for live state; do not introduce WebSockets without a protocol
   that actually requires them.
 - Reuse `dragon-core` rather than cloning Wi-Fi, discovery, event-log, or device

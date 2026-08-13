@@ -1,0 +1,61 @@
+# DragonTouch physical UI
+
+DragonTouch uses a native LVGL interface sized first for the 800×480 K-Touch and
+PandaTouch panel. It carries the existing Dragon-family design language rather than
+copying an OEM screen: charcoal background, quiet bordered cards, compact labels,
+an icon/label rail, strong hierarchy, and a single red product accent.
+
+## Design tokens
+
+| Role | Value |
+|---|---|
+| Background | `#181818` |
+| Surface | `#222222` |
+| Raised/control surface | `#303030` |
+| Border | `#3A3A3A` |
+| Text | `#F5F5F5` |
+| Muted text | `#999999` |
+| DragonTouch accent | `#EF4444` |
+| Healthy | `#74D58B` |
+| Warning | `#F59A56` |
+
+Red identifies selection, progress, and primary actions. It must not be the only
+fault signal: faults require explicit text and, where useful, an icon. Destructive
+actions must use confirmation and must not be visually confused with routine primary
+actions even though the product accent is also red.
+
+## Information architecture
+
+1. **Home:** active job, progress and time, pause/resume/cancel, temperatures, fan,
+   selected printer, and conservative quick actions.
+2. **Control:** homing/jogging, temperature targets, extrusion, and fans.
+3. **Files:** browse storage, inspect metadata/preview, and start a print.
+4. **Filament:** active tool, material slots, and load/unload flows.
+5. **Devices:** select/discover/pair printers and Dragon-family sibling products.
+6. **Settings:** Wi-Fi, display, update/recovery, diagnostics, and about.
+
+Camera/timelapse, macros, notifications, and a guarded console are secondary surfaces
+to add once the selected printer contracts exist; they should not crowd the six-item
+primary rail.
+
+This preserves the expected functions of a printer controller without making the
+physical panel a special source of truth. The printer owns motion and thermal safety;
+DragonTouch issues capability-gated requests and reflects authoritative state.
+
+## Scaffold contract
+
+`dt_ui_create()` expects the board layer to have initialized LVGL, registered a display,
+and started tick/task handling. `dt_ui_update()` accepts a passive printer view model.
+The current shell intentionally installs no hardware-command callbacks. Controls are
+disabled until product adapters expose explicit capabilities and command handlers.
+
+The UI is allowed to evolve before hardware bring-up, but it must remain possible to
+exercise it with a simulator or memory display. Real-device integration still follows
+the backup and panel gates in `BRINGUP.md`.
+
+## Reference boundary
+
+The feature categories are informed by public PaxxTouch documentation—job state,
+pause/resume/cancel, temperatures, fans, files, filament, printer management, Wi-Fi,
+and OTA—not by copying its implementation or visual assets. DragonTouch's layout and
+code are independently authored in the Dragon-family design language.

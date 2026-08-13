@@ -11,5 +11,7 @@
 - Add hardware support in measurable gates described in `docs/BRINGUP.md`.
 - Shared networking/discovery contracts belong in `dragon-core`; this repository owns
   physical board support and the DragonTouch product UI.
+- DragonTouch's product accent is red (`#EF4444`). Keep the charcoal Dragon-family
+  visual language and do not copy OEM or PaxxTouch visual assets.
 - Prefer HTTP/SSE for Dragon-family live state. Do not assume WebSockets.
 - Preserve user credentials and NVS keys across changes once a persistence schema ships.
