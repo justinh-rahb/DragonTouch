@@ -2,6 +2,10 @@
 
 ## Gate 0 — preserve recovery
 
+Follow the read-only identification and dual-backup runbook in
+[`GATE0-RECOVERY.md`](GATE0-RECOVERY.md). It deliberately stops before any erase,
+write, or restore attempt.
+
 - Identify the exact device revision and USB bridge.
 - Read chip/security information.
 - Back up the complete flash twice and compare hashes.

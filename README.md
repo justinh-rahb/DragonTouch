@@ -15,7 +15,8 @@ This repository is deliberately groundwork only. It currently provides:
 - CI that compiles the scaffold for ESP32-S3.
 
 No image in this repository is ready to flash to hardware yet. Back up a device's
-factory flash and partition table before the first HIL run.
+factory flash and partition table before the first HIL run. The read-only identification
+and dual-backup procedure is in [docs/GATE0-RECOVERY.md](docs/GATE0-RECOVERY.md).
 
 ## Build
 
