@@ -40,6 +40,8 @@ typedef struct {
     lv_obj_t *nozzle_text;
     lv_obj_t *bed_text;
     lv_obj_t *fan_text;
+    lv_obj_t *printer_name;
+    lv_obj_t *printer_hint;
     lv_obj_t *pause_button;
     lv_obj_t *pause_label;
     lv_obj_t *cancel_button;
@@ -227,8 +229,8 @@ static void create_home_page(lv_obj_t *page)
 
     lv_obj_t *printer = make_card(side, "PRINTER");
     lv_obj_set_size(printer, LV_PCT(100), 118);
-    make_label(printer, "No paired printer", DT_COLOR_TEXT);
-    make_label(printer, "Pair a same-LAN device to begin.", DT_COLOR_MUTED);
+    s_ui.printer_name = make_label(printer, "No paired printer", DT_COLOR_TEXT);
+    s_ui.printer_hint = make_label(printer, "Pair a same-LAN device to begin.", DT_COLOR_MUTED);
 }
 
 static void create_stub_page(lv_obj_t *page, const char *title, const char *description,
@@ -417,6 +419,14 @@ static void format_duration(char *buffer, size_t length, uint32_t seconds)
     snprintf(buffer, length, "%luh %02lum", (unsigned long)hours, (unsigned long)minutes);
 }
 
+static void format_temperature(char *buffer, size_t length, float current, float target)
+{
+    int current_tenths = (int)(current * 10.0f + (current >= 0.0f ? 0.5f : -0.5f));
+    int target_whole = (int)(target + (target >= 0.0f ? 0.5f : -0.5f));
+    int fraction = current_tenths < 0 ? -(current_tenths % 10) : current_tenths % 10;
+    snprintf(buffer, length, "%d.%d / %d °C", current_tenths / 10, fraction, target_whole);
+}
+
 esp_err_t dt_ui_update(const dt_ui_model_t *model)
 {
     if (!s_ui.ready) {
@@ -428,6 +438,10 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
 
     lv_label_set_text(s_ui.device_name,
                       model->device_name != NULL ? model->device_name : "No printer");
+    const bool has_device = model->device_name != NULL && model->device_name[0] != '\0';
+    lv_label_set_text(s_ui.printer_name, has_device ? model->device_name : "No paired printer");
+    lv_label_set_text(s_ui.printer_hint,
+                      has_device ? "Selected same-LAN printer" : "Pair a same-LAN device to begin.");
     const char *connection = "Offline";
     uint32_t connection_color = DT_COLOR_MUTED;
     if (model->connection == DT_UI_CONNECTION_CONNECTING) {
@@ -455,10 +469,12 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
     format_duration(remaining, sizeof(remaining), model->remaining_seconds);
     snprintf(time_line, sizeof(time_line), "Elapsed %s  •  Remaining %s", elapsed, remaining);
     lv_label_set_text(s_ui.time_text, time_line);
-    lv_label_set_text_fmt(s_ui.nozzle_text, "%.1f / %.0f °C",
-                          model->nozzle_c, model->nozzle_target_c);
-    lv_label_set_text_fmt(s_ui.bed_text, "%.1f / %.0f °C",
-                          model->bed_c, model->bed_target_c);
+    char temperature[32];
+    format_temperature(temperature, sizeof(temperature),
+                       model->nozzle_c, model->nozzle_target_c);
+    lv_label_set_text(s_ui.nozzle_text, temperature);
+    format_temperature(temperature, sizeof(temperature), model->bed_c, model->bed_target_c);
+    lv_label_set_text(s_ui.bed_text, temperature);
     lv_label_set_text_fmt(s_ui.fan_text, "%u%%", model->fan_percent);
 
     const bool paused = model->job_state == DT_UI_JOB_PAUSED;

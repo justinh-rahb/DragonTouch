@@ -53,6 +53,27 @@ The UI is allowed to evolve before hardware bring-up, but it must remain possibl
 exercise it with a simulator or memory display. Real-device integration still follows
 the backup and panel gates in `BRINGUP.md`.
 
+## Desktop preview
+
+On macOS with SDL2, CMake, Ninja, `pkg-config`, and ImageMagick installed, render the
+real `dt_ui` component at 800×480 with representative printer state:
+
+```sh
+./tools/render_ui_preview.sh
+```
+
+The generated frame is written to `docs/assets/ui-preview.png`. The host harness uses
+only compatibility stubs for ESP logging/error types; the UI source is the same file
+compiled into the ESP-IDF component.
+
+![DragonTouch LVGL home-screen preview](assets/ui-preview.png)
+
+For a clickable preview that remains open until its window is closed:
+
+```sh
+./tools/render_ui_preview.sh --interactive
+```
+
 ## Reference boundary
 
 The feature categories are informed by public PaxxTouch documentation—job state,
