@@ -33,7 +33,6 @@ typedef struct {
     lv_obj_t *pages[DT_PAGE_COUNT];
     lv_obj_t *nav_buttons[DT_PAGE_COUNT];
     lv_obj_t *nav_icons[DT_PAGE_COUNT];
-    lv_obj_t *nav_labels[DT_PAGE_COUNT];
     lv_obj_t *device_name;
     lv_obj_t *connection_dot;
     lv_obj_t *connection_text;
@@ -265,8 +264,6 @@ static void show_page(dt_ui_page_t selected)
             lv_obj_add_flag(s_ui.pages[i], LV_OBJ_FLAG_HIDDEN);
         }
         lv_obj_set_style_text_color(s_ui.nav_icons[i],
-                                    color(active ? DT_COLOR_ACCENT : DT_COLOR_MUTED), 0);
-        lv_obj_set_style_text_color(s_ui.nav_labels[i],
                                     color(active ? DT_COLOR_ACCENT : DT_COLOR_MUTED), 0);
         lv_obj_set_style_bg_opa(s_ui.nav_buttons[i], active ? LV_OPA_20 : LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(s_ui.nav_buttons[i], active ? 3 : 0, 0);
@@ -715,9 +712,6 @@ static void create_dialog_overlay(void)
 
 static void create_shell(lv_display_t *display)
 {
-    static const char *nav_names[DT_PAGE_COUNT] = {
-        "Home", "Control", "Files", "Filament", "Devices", "Settings"
-    };
     static const dt_nav_icon_t nav_icons[DT_PAGE_COUNT] = {
         DT_NAV_ICON_HOME,
         DT_NAV_ICON_CONTROL,
@@ -738,7 +732,7 @@ static void create_shell(lv_display_t *display)
 
     lv_obj_t *rail = lv_obj_create(s_ui.screen);
     lv_obj_remove_style_all(rail);
-    lv_obj_set_size(rail, 80, LV_PCT(100));
+    lv_obj_set_size(rail, 60, LV_PCT(100));
     lv_obj_set_style_bg_color(rail, color(DT_COLOR_SURFACE), 0);
     lv_obj_set_style_bg_opa(rail, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(rail, color(DT_COLOR_BORDER), 0);
@@ -750,10 +744,16 @@ static void create_shell(lv_display_t *display)
     lv_obj_set_flex_flow(rail, LV_FLEX_FLOW_COLUMN);
 
     for (int i = 0; i < DT_PAGE_COUNT; ++i) {
+        if (i == DT_UI_PAGE_SETTINGS) {
+            lv_obj_t *spacer = lv_obj_create(rail);
+            lv_obj_remove_style_all(spacer);
+            lv_obj_set_width(spacer, LV_PCT(100));
+            lv_obj_set_flex_grow(spacer, 1);
+        }
         lv_obj_t *button = lv_button_create(rail);
         lv_obj_remove_style_all(button);
         s_ui.nav_buttons[i] = button;
-        lv_obj_set_size(button, LV_PCT(100), 58);
+        lv_obj_set_size(button, LV_PCT(100), 52);
         lv_obj_set_style_bg_color(button, color(DT_COLOR_ACCENT), 0);
         lv_obj_set_style_bg_opa(button, LV_OPA_TRANSP, 0);
         lv_obj_set_style_shadow_width(button, 0, 0);
@@ -765,8 +765,6 @@ static void create_shell(lv_display_t *display)
         lv_obj_set_style_pad_row(button, 1, 0);
         lv_obj_add_event_cb(button, nav_event, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
         s_ui.nav_icons[i] = make_nav_icon(button, nav_icons[i]);
-        s_ui.nav_labels[i] = make_label(button, nav_names[i], DT_COLOR_MUTED);
-        lv_obj_set_style_text_font(s_ui.nav_labels[i], &lv_font_montserrat_12, 0);
     }
 
     lv_obj_t *body = lv_obj_create(s_ui.screen);

@@ -3,11 +3,12 @@
 DragonTouch uses a native LVGL interface sized first for the 800×480 K-Touch and
 PandaTouch panel. It carries the existing Dragon-family design language rather than
 copying an OEM screen: charcoal background, quiet bordered cards, compact labels,
-an icon/label rail, strong hierarchy, and a single red product accent.
+an icon-only rail, strong hierarchy, and a single red product accent.
 
 The primary rail uses code-drawn, two-pixel outline icons that echo the Lucide-derived
 Dragon WebUI sprite: house and slider-settings shapes are family-aligned, while motion,
 file, spool, and display symbols make the printer-specific destinations unambiguous.
+Settings is pinned to the bottom of the icon-only rail, matching the WebUI convention.
 
 ## Design tokens
 
