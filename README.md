@@ -18,6 +18,15 @@ No image in this repository is ready to flash to hardware yet. Back up a device'
 factory flash and partition table before the first HIL run. The read-only identification
 and dual-backup procedure is in [docs/GATE0-RECOVERY.md](docs/GATE0-RECOVERY.md).
 
+## UI preview
+
+![DragonTouch work-in-progress LVGL printer console](docs/assets/ui-preview.png)
+
+The work-in-progress interface above is rendered by the desktop SDL harness from the
+same LVGL source used by the firmware. It is an interaction and visual-design preview;
+panel, touch, backlight, networking, and machine-command integration are not enabled.
+See [docs/UI.md](docs/UI.md) for the UI contract and simulator workflow.
+
 ## Build
 
 ```sh
