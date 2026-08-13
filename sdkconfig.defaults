@@ -1,0 +1,14 @@
+# Known target envelope from the K-Touch/PandaTouch reference build.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# The board is described as an ESP32-S3 module with octal PSRAM. Keep large UI
+# buffers external so internal SRAM remains available for RGB DMA and Wi-Fi.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+
+CONFIG_COMPILER_WARN_WRITE_STRINGS=y
