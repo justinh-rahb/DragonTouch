@@ -19,10 +19,21 @@
 #define DT_CONTROL_TAB_COUNT 4
 #define DT_FILES_TAB_COUNT 3
 
+typedef enum {
+    DT_NAV_ICON_HOME = 0,
+    DT_NAV_ICON_CONTROL,
+    DT_NAV_ICON_FILES,
+    DT_NAV_ICON_FILAMENT,
+    DT_NAV_ICON_DEVICES,
+    DT_NAV_ICON_SETTINGS,
+} dt_nav_icon_t;
+
 typedef struct {
     lv_obj_t *screen;
     lv_obj_t *pages[DT_PAGE_COUNT];
     lv_obj_t *nav_buttons[DT_PAGE_COUNT];
+    lv_obj_t *nav_icons[DT_PAGE_COUNT];
+    lv_obj_t *nav_labels[DT_PAGE_COUNT];
     lv_obj_t *device_name;
     lv_obj_t *connection_dot;
     lv_obj_t *connection_text;
@@ -57,6 +68,126 @@ static dt_ui_state_t s_ui;
 static lv_color_t color(uint32_t hex)
 {
     return lv_color_hex(hex);
+}
+
+static void draw_icon_line(lv_layer_t *layer, lv_color_t line_color,
+                           int32_t x, int32_t y, int32_t x1, int32_t y1,
+                           int32_t x2, int32_t y2)
+{
+    lv_draw_line_dsc_t line;
+    lv_draw_line_dsc_init(&line);
+    line.color = line_color;
+    line.width = 2;
+    line.round_start = true;
+    line.round_end = true;
+    line.p1.x = x + x1;
+    line.p1.y = y + y1;
+    line.p2.x = x + x2;
+    line.p2.y = y + y2;
+    lv_draw_line(layer, &line);
+}
+
+static void draw_icon_circle(lv_layer_t *layer, lv_color_t line_color,
+                             int32_t x, int32_t y, int32_t cx, int32_t cy,
+                             uint16_t radius)
+{
+    lv_draw_arc_dsc_t arc;
+    lv_draw_arc_dsc_init(&arc);
+    arc.color = line_color;
+    arc.width = 2;
+    arc.center.x = x + cx;
+    arc.center.y = y + cy;
+    arc.radius = radius;
+    arc.start_angle = 0;
+    arc.end_angle = 360;
+    lv_draw_arc(layer, &arc);
+}
+
+static void draw_icon_rect(lv_layer_t *layer, lv_color_t line_color,
+                           int32_t x, int32_t y, int32_t x1, int32_t y1,
+                           int32_t x2, int32_t y2)
+{
+    draw_icon_line(layer, line_color, x, y, x1, y1, x2, y1);
+    draw_icon_line(layer, line_color, x, y, x2, y1, x2, y2);
+    draw_icon_line(layer, line_color, x, y, x2, y2, x1, y2);
+    draw_icon_line(layer, line_color, x, y, x1, y2, x1, y1);
+}
+
+static void nav_icon_draw(lv_event_t *event)
+{
+    lv_obj_t *icon = lv_event_get_target_obj(event);
+    lv_layer_t *layer = lv_event_get_layer(event);
+    dt_nav_icon_t type = (dt_nav_icon_t)(uintptr_t)lv_event_get_user_data(event);
+    lv_area_t area;
+    lv_obj_get_coords(icon, &area);
+    const int32_t x = area.x1;
+    const int32_t y = area.y1;
+    lv_color_t line_color = lv_obj_get_style_text_color(icon, LV_PART_MAIN);
+
+    switch (type) {
+    case DT_NAV_ICON_HOME:
+        draw_icon_line(layer, line_color, x, y, 2, 10, 11, 3);
+        draw_icon_line(layer, line_color, x, y, 11, 3, 20, 10);
+        draw_icon_line(layer, line_color, x, y, 4, 9, 4, 20);
+        draw_icon_line(layer, line_color, x, y, 18, 9, 18, 20);
+        draw_icon_line(layer, line_color, x, y, 4, 20, 18, 20);
+        draw_icon_rect(layer, line_color, x, y, 9, 13, 13, 20);
+        break;
+    case DT_NAV_ICON_CONTROL:
+        draw_icon_line(layer, line_color, x, y, 3, 11, 19, 11);
+        draw_icon_line(layer, line_color, x, y, 3, 11, 6, 8);
+        draw_icon_line(layer, line_color, x, y, 3, 11, 6, 14);
+        draw_icon_line(layer, line_color, x, y, 19, 11, 16, 8);
+        draw_icon_line(layer, line_color, x, y, 19, 11, 16, 14);
+        draw_icon_line(layer, line_color, x, y, 11, 3, 11, 19);
+        draw_icon_line(layer, line_color, x, y, 11, 3, 8, 6);
+        draw_icon_line(layer, line_color, x, y, 11, 3, 14, 6);
+        draw_icon_line(layer, line_color, x, y, 11, 19, 8, 16);
+        draw_icon_line(layer, line_color, x, y, 11, 19, 14, 16);
+        break;
+    case DT_NAV_ICON_FILES:
+        draw_icon_line(layer, line_color, x, y, 5, 2, 14, 2);
+        draw_icon_line(layer, line_color, x, y, 14, 2, 19, 7);
+        draw_icon_line(layer, line_color, x, y, 19, 7, 19, 20);
+        draw_icon_line(layer, line_color, x, y, 19, 20, 5, 20);
+        draw_icon_line(layer, line_color, x, y, 5, 20, 5, 2);
+        draw_icon_line(layer, line_color, x, y, 14, 2, 14, 7);
+        draw_icon_line(layer, line_color, x, y, 14, 7, 19, 7);
+        draw_icon_line(layer, line_color, x, y, 8, 12, 16, 12);
+        draw_icon_line(layer, line_color, x, y, 8, 16, 16, 16);
+        break;
+    case DT_NAV_ICON_FILAMENT:
+        draw_icon_rect(layer, line_color, x, y, 3, 2, 6, 20);
+        draw_icon_rect(layer, line_color, x, y, 16, 2, 19, 20);
+        draw_icon_line(layer, line_color, x, y, 6, 7, 16, 7);
+        draw_icon_line(layer, line_color, x, y, 6, 11, 16, 11);
+        draw_icon_line(layer, line_color, x, y, 6, 15, 16, 15);
+        break;
+    case DT_NAV_ICON_DEVICES:
+        draw_icon_rect(layer, line_color, x, y, 2, 3, 20, 15);
+        draw_icon_line(layer, line_color, x, y, 11, 15, 11, 19);
+        draw_icon_line(layer, line_color, x, y, 7, 19, 15, 19);
+        draw_icon_circle(layer, line_color, x, y, 16, 7, 1);
+        break;
+    case DT_NAV_ICON_SETTINGS:
+        draw_icon_line(layer, line_color, x, y, 2, 6, 4, 6);
+        draw_icon_line(layer, line_color, x, y, 10, 6, 20, 6);
+        draw_icon_circle(layer, line_color, x, y, 7, 6, 3);
+        draw_icon_line(layer, line_color, x, y, 2, 16, 12, 16);
+        draw_icon_line(layer, line_color, x, y, 18, 16, 20, 16);
+        draw_icon_circle(layer, line_color, x, y, 15, 16, 3);
+        break;
+    }
+}
+
+static lv_obj_t *make_nav_icon(lv_obj_t *parent, dt_nav_icon_t type)
+{
+    lv_obj_t *icon = lv_obj_create(parent);
+    lv_obj_remove_style_all(icon);
+    lv_obj_set_size(icon, 22, 22);
+    lv_obj_set_style_text_color(icon, color(DT_COLOR_MUTED), 0);
+    lv_obj_add_event_cb(icon, nav_icon_draw, LV_EVENT_DRAW_MAIN, (void *)(uintptr_t)type);
+    return icon;
 }
 
 static void style_surface(lv_obj_t *obj)
@@ -133,9 +264,9 @@ static void show_page(dt_ui_page_t selected)
         } else {
             lv_obj_add_flag(s_ui.pages[i], LV_OBJ_FLAG_HIDDEN);
         }
-        lv_obj_set_style_text_color(s_ui.nav_buttons[i],
+        lv_obj_set_style_text_color(s_ui.nav_icons[i],
                                     color(active ? DT_COLOR_ACCENT : DT_COLOR_MUTED), 0);
-        lv_obj_set_style_text_color(lv_obj_get_child(s_ui.nav_buttons[i], 0),
+        lv_obj_set_style_text_color(s_ui.nav_labels[i],
                                     color(active ? DT_COLOR_ACCENT : DT_COLOR_MUTED), 0);
         lv_obj_set_style_bg_opa(s_ui.nav_buttons[i], active ? LV_OPA_20 : LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(s_ui.nav_buttons[i], active ? 3 : 0, 0);
@@ -587,6 +718,14 @@ static void create_shell(lv_display_t *display)
     static const char *nav_names[DT_PAGE_COUNT] = {
         "Home", "Control", "Files", "Filament", "Devices", "Settings"
     };
+    static const dt_nav_icon_t nav_icons[DT_PAGE_COUNT] = {
+        DT_NAV_ICON_HOME,
+        DT_NAV_ICON_CONTROL,
+        DT_NAV_ICON_FILES,
+        DT_NAV_ICON_FILAMENT,
+        DT_NAV_ICON_DEVICES,
+        DT_NAV_ICON_SETTINGS,
+    };
 
     s_ui.screen = lv_obj_create(NULL);
     lv_obj_remove_style_all(s_ui.screen);
@@ -599,7 +738,7 @@ static void create_shell(lv_display_t *display)
 
     lv_obj_t *rail = lv_obj_create(s_ui.screen);
     lv_obj_remove_style_all(rail);
-    lv_obj_set_size(rail, 76, LV_PCT(100));
+    lv_obj_set_size(rail, 80, LV_PCT(100));
     lv_obj_set_style_bg_color(rail, color(DT_COLOR_SURFACE), 0);
     lv_obj_set_style_bg_opa(rail, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(rail, color(DT_COLOR_BORDER), 0);
@@ -614,16 +753,20 @@ static void create_shell(lv_display_t *display)
         lv_obj_t *button = lv_button_create(rail);
         lv_obj_remove_style_all(button);
         s_ui.nav_buttons[i] = button;
-        lv_obj_set_size(button, LV_PCT(100), 50);
+        lv_obj_set_size(button, LV_PCT(100), 58);
         lv_obj_set_style_bg_color(button, color(DT_COLOR_ACCENT), 0);
         lv_obj_set_style_bg_opa(button, LV_OPA_TRANSP, 0);
         lv_obj_set_style_shadow_width(button, 0, 0);
         lv_obj_set_style_radius(button, 4, 0);
-        lv_obj_set_style_text_color(button, color(DT_COLOR_MUTED), 0);
+        lv_obj_set_layout(button, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(button, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(button, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_row(button, 1, 0);
         lv_obj_add_event_cb(button, nav_event, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
-        lv_obj_t *label = make_label(button, nav_names[i], DT_COLOR_MUTED);
-        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
-        lv_obj_center(label);
+        s_ui.nav_icons[i] = make_nav_icon(button, nav_icons[i]);
+        s_ui.nav_labels[i] = make_label(button, nav_names[i], DT_COLOR_MUTED);
+        lv_obj_set_style_text_font(s_ui.nav_labels[i], &lv_font_montserrat_12, 0);
     }
 
     lv_obj_t *body = lv_obj_create(s_ui.screen);

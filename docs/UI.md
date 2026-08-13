@@ -5,6 +5,10 @@ PandaTouch panel. It carries the existing Dragon-family design language rather t
 copying an OEM screen: charcoal background, quiet bordered cards, compact labels,
 an icon/label rail, strong hierarchy, and a single red product accent.
 
+The primary rail uses code-drawn, two-pixel outline icons that echo the Lucide-derived
+Dragon WebUI sprite: house and slider-settings shapes are family-aligned, while motion,
+file, spool, and display symbols make the printer-specific destinations unambiguous.
+
 ## Design tokens
 
 | Role | Value |
