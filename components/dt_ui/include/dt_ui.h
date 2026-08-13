@@ -24,6 +24,15 @@ typedef enum {
     DT_UI_JOB_ERROR,
 } dt_ui_job_state_t;
 
+typedef enum {
+    DT_UI_PAGE_HOME = 0,
+    DT_UI_PAGE_CONTROL,
+    DT_UI_PAGE_FILES,
+    DT_UI_PAGE_FILAMENT,
+    DT_UI_PAGE_DEVICES,
+    DT_UI_PAGE_SETTINGS,
+} dt_ui_page_t;
+
 typedef struct {
     const char *device_name;
     dt_ui_connection_t connection;
@@ -52,6 +61,9 @@ esp_err_t dt_ui_create(lv_display_t *display);
 
 /** Update the passive dashboard view. Call while holding the LVGL lock. */
 esp_err_t dt_ui_update(const dt_ui_model_t *model);
+
+/** Select a primary surface. Useful to restore navigation state and drive host previews. */
+esp_err_t dt_ui_show_page(dt_ui_page_t page);
 
 #ifdef __cplusplus
 }

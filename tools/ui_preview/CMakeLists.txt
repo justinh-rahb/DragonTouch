@@ -25,4 +25,5 @@ target_include_directories(dragon_touch_ui_preview PRIVATE
     host_stubs
     ../../components/dt_ui/include
 )
+target_compile_definitions(dragon_touch_ui_preview PRIVATE DT_UI_HOST_PREVIEW=1)
 target_link_libraries(dragon_touch_ui_preview PRIVATE lvgl PkgConfig::SDL2)

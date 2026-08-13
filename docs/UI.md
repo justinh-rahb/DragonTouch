@@ -24,6 +24,11 @@ fault signal: faults require explicit text and, where useful, an icon. Destructi
 actions must use confirmation and must not be visually confused with routine primary
 actions even though the product accent is also red.
 
+The current scaffold renders cancel as a warning-colored outlined action instead of
+a routine red primary action. Cancel, homing, heating, and extrusion open review
+dialogs that explain printer authority. Their final buttons remain disabled and are
+labelled as preview-only until capability-aware command handlers are attached.
+
 ## Information architecture
 
 1. **Home:** active job, progress and time, pause/resume/cancel, temperatures, fan,
@@ -73,6 +78,30 @@ For a clickable preview that remains open until its window is closed:
 ```sh
 ./tools/render_ui_preview.sh --interactive
 ```
+
+The interactive preview accepts `--scenario printing|disconnected|idle|paused|fault`
+and `--page home|control|files|filament|devices|settings`. Control and Files include
+their own secondary tab rows so related functions do not compete for primary rail
+space.
+
+Generate all committed state baselines, or compare freshly rendered pixels against
+them, with:
+
+```sh
+./tools/render_ui_preview.sh --all
+./tools/render_ui_preview.sh --check
+```
+
+The comparison is intentionally lightweight and exact: it reports any changed pixel.
+Review intentional visual changes and regenerate the baselines with `--all`.
+
+| Scenario | Baseline |
+|---|---|
+| Printing | `assets/ui-preview.png` |
+| Disconnected | `assets/ui-disconnected.png` |
+| Idle | `assets/ui-idle.png` |
+| Paused | `assets/ui-paused.png` |
+| Fault | `assets/ui-fault.png` |
 
 ## Reference boundary
 
