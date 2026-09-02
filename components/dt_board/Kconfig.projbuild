@@ -1,0 +1,15 @@
+menu "DragonTouch hardware"
+
+choice DT_BOARD
+    prompt "Target board"
+    default DT_BOARD_KTOUCH
+
+    config DT_BOARD_KTOUCH
+        bool "BIGTREETECH K-Touch / PandaTouch"
+
+    config DT_BOARD_WAVESHARE_ESP32_S3_TOUCH_LCD_7
+        bool "Waveshare ESP32-S3-Touch-LCD-7"
+
+endchoice
+
+endmenu
