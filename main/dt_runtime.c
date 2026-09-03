@@ -1,4 +1,5 @@
 #include "dt_runtime.h"
+#include "dt_portal.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -23,11 +24,56 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 
 #include "nvs.h"
 
 
 static const char *TAG = "dt_runtime";
+
+
+/*
+ * RUNTIME_HEAP_DIAG
+ * Temporary Stage 3 allocator diagnostics.
+ */
+static void runtime_heap_diag(const char *where)
+{
+    const size_t free_internal =
+        heap_caps_get_free_size(
+            MALLOC_CAP_INTERNAL |
+            MALLOC_CAP_8BIT
+        );
+
+    const size_t largest_internal =
+        heap_caps_get_largest_free_block(
+            MALLOC_CAP_INTERNAL |
+            MALLOC_CAP_8BIT
+        );
+
+    const size_t free_dma =
+        heap_caps_get_free_size(
+            MALLOC_CAP_INTERNAL |
+            MALLOC_CAP_DMA
+        );
+
+    const size_t largest_dma =
+        heap_caps_get_largest_free_block(
+            MALLOC_CAP_INTERNAL |
+            MALLOC_CAP_DMA
+        );
+
+    ESP_LOGI(
+        TAG,
+        "RUNTIME_HEAP %s internal=%u largest=%u dma=%u dma_largest=%u psram=%u psram_largest=%u",
+        where,
+        (unsigned)free_internal,
+        (unsigned)largest_internal,
+        (unsigned)free_dma,
+        (unsigned)largest_dma,
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)
+    );
+}
 
 #define DT_STATUS_PERIOD_MS   1000
 #define DT_HTTP_TIMEOUT_MS    3500
@@ -177,63 +223,48 @@ static bool load_nvs_string(
 
 static void load_moonraker_config(void)
 {
-    load_nvs_string(
-        "mk_host",
-        s_moonraker_host,
-        sizeof(s_moonraker_host)
-    );
+    dc_moonraker_config_t cfg = {0};
 
-    /*
-     * Optional. If no key exists, Moonraker's normal trusted-client
-     * authorization is used.
-     */
-    load_nvs_string(
-        "mk_api_key",
-        s_api_key,
-        sizeof(s_api_key)
-    );
+    esp_err_t err =
+        dc_moonraker_get_config(
+            &cfg
+        );
 
-    if (s_moonraker_host[0] == '\0') {
+    if (
+        err != ESP_OK ||
+        cfg.host[0] == '\0'
+    ) {
+        s_moonraker_host[0] = '\0';
         s_base_url[0] = '\0';
+        s_api_key[0] = '\0';
         return;
     }
 
-    if (
-        strncmp(
-            s_moonraker_host,
-            "http://",
-            7
-        ) == 0 ||
-        strncmp(
-            s_moonraker_host,
-            "https://",
-            8
-        ) == 0
-    ) {
-        snprintf(
-            s_base_url,
-            sizeof(s_base_url),
-            "%s",
-            s_moonraker_host
-        );
-    } else {
-        snprintf(
-            s_base_url,
-            sizeof(s_base_url),
-            "http://%s",
-            s_moonraker_host
-        );
+    if (cfg.port == 0) {
+        cfg.port = 7125;
     }
 
-    size_t n =
-        strlen(s_base_url);
+    snprintf(
+        s_moonraker_host,
+        sizeof(s_moonraker_host),
+        "%s",
+        cfg.host
+    );
 
-    while (
-        n > 0 &&
-        s_base_url[n - 1] == '/'
-    ) {
-        s_base_url[--n] = '\0';
-    }
+    snprintf(
+        s_api_key,
+        sizeof(s_api_key),
+        "%s",
+        cfg.api_key
+    );
+
+    snprintf(
+        s_base_url,
+        sizeof(s_base_url),
+        "http://%s:%u",
+        cfg.host,
+        (unsigned)cfg.port
+    );
 }
 
 
@@ -1200,132 +1231,130 @@ static void ui_action_handler(
 }
 
 
-static void action_task(void *arg)
+static void runtime_task(void *arg)
 {
     (void)arg;
 
-    dt_ui_action_t action;
-
-    for (;;) {
-        if (
-            xQueueReceive(
-                s_action_queue,
-                &action,
-                portMAX_DELAY
-            ) != pdTRUE
-        ) {
-            continue;
-        }
-
-        ESP_LOGI(
-            TAG,
-            "executing UI action %d",
-            (int)action
-        );
-
-        esp_err_t err =
-            execute_action(action);
-
-        if (err != ESP_OK) {
-            ESP_LOGE(
-                TAG,
-                "UI action %d failed: %s",
-                (int)action,
-                esp_err_to_name(err)
-            );
-        } else {
-            ESP_LOGI(
-                TAG,
-                "UI action %d accepted",
-                (int)action
-            );
-        }
-    }
-}
-
-
-static void status_task(void *arg)
-{
-    (void)arg;
-
+    /* DT_RUNTIME_SINGLE_WORKER */
     ESP_LOGI(
         TAG,
-        "Moonraker status task "
-        "started on CPU%d",
+        "runtime worker started on CPU%d",
         xPortGetCoreID()
     );
 
     unsigned failure_count = 0;
+    TickType_t last_status =
+        xTaskGetTickCount() -
+        pdMS_TO_TICKS(DT_STATUS_PERIOD_MS);
 
     for (;;) {
-        runtime_snapshot_t snap;
+        dt_ui_action_t action;
 
-        const bool online =
-            query_status(&snap);
+        while (
+            xQueueReceive(
+                s_action_queue,
+                &action,
+                0
+            ) == pdTRUE
+        ) {
+            ESP_LOGI(
+                TAG,
+                "executing UI action %d",
+                (int)action
+            );
 
-        if (online) {
-            failure_count = 0;
-        } else {
-            failure_count++;
+            esp_err_t err =
+                execute_action(action);
 
-            if (
-                failure_count == 1 ||
-                failure_count % 30 == 0
-            ) {
-                ESP_LOGW(
+            if (err != ESP_OK) {
+                ESP_LOGE(
                     TAG,
-                    "Moonraker status unavailable "
-                    "(attempt %u)",
-                    failure_count
+                    "UI action %d failed: %s",
+                    (int)action,
+                    esp_err_to_name(err)
+                );
+            } else {
+                ESP_LOGI(
+                    TAG,
+                    "UI action %d accepted",
+                    (int)action
                 );
             }
         }
 
+        TickType_t now = xTaskGetTickCount();
+
         if (
-            !s_have_previous ||
-            !snapshot_equal(
-                &snap,
-                &s_previous
-            )
+            now - last_status >=
+            pdMS_TO_TICKS(DT_STATUS_PERIOD_MS)
         ) {
-            push_ui(&snap);
+            last_status = now;
 
-            s_previous = snap;
-            s_have_previous = true;
+            runtime_snapshot_t snap;
+            const bool online = query_status(&snap);
 
-            ESP_LOGI(
-                TAG,
-                "state conn=%d job=%d "
-                "progress=%u "
-                "nozzle=%.1f/%.1f "
-                "bed=%.1f/%.1f "
-                "xyz=%.1f,%.1f,%.1f",
-                (int)snap.connection,
-                (int)snap.job,
-                (unsigned)
-                    snap.progress_percent,
-                snap.nozzle_c,
-                snap.nozzle_target_c,
-                snap.bed_c,
-                snap.bed_target_c,
-                snap.x,
-                snap.y,
-                snap.z
-            );
+            if (online) {
+                failure_count = 0;
+            } else {
+                failure_count++;
+                if (
+                    failure_count == 1 ||
+                    failure_count % 30 == 0
+                ) {
+                    ESP_LOGW(
+                        TAG,
+                        "Moonraker status unavailable (attempt %u)",
+                        failure_count
+                    );
+                }
+            }
+
+            if (
+                !s_have_previous ||
+                !snapshot_equal(&snap, &s_previous)
+            ) {
+                push_ui(&snap);
+                s_previous = snap;
+                s_have_previous = true;
+
+                ESP_LOGI(
+                    TAG,
+                    "state conn=%d job=%d progress=%u "
+                    "nozzle=%.1f/%.1f bed=%.1f/%.1f "
+                    "xyz=%.1f,%.1f,%.1f",
+                    (int)snap.connection,
+                    (int)snap.job,
+                    (unsigned)snap.progress_percent,
+                    snap.nozzle_c,
+                    snap.nozzle_target_c,
+                    snap.bed_c,
+                    snap.bed_target_c,
+                    snap.x,
+                    snap.y,
+                    snap.z
+                );
+            }
         }
 
-        vTaskDelay(
-            pdMS_TO_TICKS(
-                DT_STATUS_PERIOD_MS
-            )
-        );
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
 
-esp_err_t dt_runtime_start(void)
+
+
+
+
+static bool s_network_phase_attempted;
+static esp_err_t s_network_phase_result = ESP_FAIL;
+
+esp_err_t dt_runtime_network_start(void)
 {
-    load_moonraker_config();
+    if (s_network_phase_attempted) {
+        return s_network_phase_result;
+    }
+
+    s_network_phase_attempted = true;
 
     const dc_wifi_identity_t identity = {
         .hostname =
@@ -1354,7 +1383,11 @@ esp_err_t dt_runtime_start(void)
         );
     }
 
+    runtime_heap_diag("early-before-wifi");
+
     err = dc_wifi_start();
+
+    runtime_heap_diag("early-after-wifi");
 
     if (err != ESP_OK) {
         ESP_LOGE(
@@ -1362,27 +1395,55 @@ esp_err_t dt_runtime_start(void)
             "dc_wifi_start: %s",
             esp_err_to_name(err)
         );
-    } else {
-        (void)esp_wifi_set_ps(
-            WIFI_PS_NONE
-        );
+
+        s_network_phase_result = err;
+        return err;
     }
 
-    /*
-     * Keep dragon-core's WebSocket Moonraker client active.
-     * DragonTouch Stage 2 uses the public HTTP API alongside it
-     * for richer HMI telemetry and commands not yet exposed by
-     * dc_moonraker's shared status structure.
-     */
-    err = dc_moonraker_start();
+    (void)esp_wifi_set_ps(
+        WIFI_PS_NONE
+    );
+
+    runtime_heap_diag("moonraker-client-skipped");
+    runtime_heap_diag("early-before-portal");
+
+    err = dt_portal_start();
+
+    runtime_heap_diag("early-after-portal");
+
+    if (err != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "dt_portal_start: %s",
+            esp_err_to_name(err)
+        );
+
+        s_network_phase_result = err;
+        return err;
+    }
+
+    s_network_phase_result = ESP_OK;
+    return ESP_OK;
+}
+
+
+esp_err_t dt_runtime_start(void)
+{
+    load_moonraker_config();
+
+    esp_err_t err =
+        dt_runtime_network_start();
 
     if (err != ESP_OK) {
         ESP_LOGW(
             TAG,
-            "dc_moonraker_start: %s",
+            "network/portal unavailable: %s; "
+            "runtime worker will continue",
             esp_err_to_name(err)
         );
     }
+
+    runtime_heap_diag("network-phase-complete");
 
     s_action_queue =
         xQueueCreate(
@@ -1401,32 +1462,29 @@ esp_err_t dt_runtime_start(void)
         )
     );
 
-    BaseType_t action_created =
-        xTaskCreatePinnedToCore(
-            action_task,
-            "dt_commands",
-            6144,
+    runtime_heap_diag("before-worker");
+
+    /*
+     * DT_RUNTIME_PSRAM_WORKER
+     *
+     * This worker performs sockets/HTTP only. NVS config is loaded before
+     * task creation; portal writes reboot before new config is consumed.
+     */
+    BaseType_t worker_created =
+        xTaskCreatePinnedToCoreWithCaps(
+            runtime_task,
+            "dt_runtime",
+            7168,
             NULL,
             4,
             NULL,
-            1
+            1,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
         );
 
-    BaseType_t status_created =
-        xTaskCreatePinnedToCore(
-            status_task,
-            "dt_status",
-            7168,
-            NULL,
-            3,
-            NULL,
-            1
-        );
+    runtime_heap_diag("after-worker");
 
-    if (
-        action_created != pdPASS ||
-        status_created != pdPASS
-    ) {
+    if (worker_created != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
 

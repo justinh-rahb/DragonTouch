@@ -82,6 +82,27 @@ void app_main(void)
 
     init_nvs();
 
+    /*
+     * DT_EARLY_NETWORK_START
+     *
+     * Reserve Wi-Fi and dc_portal's mandatory internal HTTPD stack
+     * before display/LVGL allocations fragment internal RAM.
+     * Network failure remains non-fatal to the local UI.
+     */
+    esp_err_t early_network_err =
+        dt_runtime_network_start();
+
+    if (early_network_err != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "early network/portal start failed: %s; "
+            "continuing local UI",
+            esp_err_to_name(
+                early_network_err
+            )
+        );
+    }
+
     lv_display_t *display = NULL;
 
     ESP_ERROR_CHECK(

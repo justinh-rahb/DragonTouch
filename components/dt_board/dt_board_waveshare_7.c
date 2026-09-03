@@ -1103,6 +1103,15 @@ esp_err_t dt_board_waveshare_7_lvgl_init(lv_display_t **display)
      */
     lvgl_port_cfg_t port_cfg =
         ESP_LVGL_PORT_INIT_CONFIG();
+    /*
+     * Keep the LVGL task stack in PSRAM so dc_portal can retain
+     * its required 8192-byte internal HTTPD stack concurrently.
+     * Draw buffers remain internal DMA SRAM; only task stack moves.
+     */
+    port_cfg.task_stack_caps =
+        MALLOC_CAP_SPIRAM |
+        MALLOC_CAP_8BIT;
+
 
     port_cfg.task_priority = 4;
     port_cfg.task_stack = 16384;
@@ -1143,8 +1152,13 @@ esp_err_t dt_board_waveshare_7_lvgl_init(lv_display_t **display)
         },
 
         .flags = {
-            .buff_dma = true,
-            .buff_spiram = false,
+            /*
+             * LVGL renders into PSRAM scratch buffers.
+             * The RGB driver's internal 10-line bounce buffers
+             * remain DMA-capable and feed the LCD EDMA engine.
+             */
+            .buff_dma = false,
+            .buff_spiram = true,
             .sw_rotate = false,
             .swap_bytes = false,
             .full_refresh = false,

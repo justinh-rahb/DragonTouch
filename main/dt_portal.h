@@ -6,8 +6,7 @@
 extern "C" {
 #endif
 
-esp_err_t dt_runtime_network_start(void);
-esp_err_t dt_runtime_start(void);
+esp_err_t dt_portal_start(void);
 
 #ifdef __cplusplus
 }

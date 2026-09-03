@@ -8,3 +8,7 @@ dependencies:
     path: ../../dragon-core/components/dc_moonraker
   dc_wifi:
     path: ../../dragon-core/components/dc_wifi
+  dc_portal:
+    path: ../../dragon-core/components/dc_portal
+  dc_ui:
+    path: ../../dragon-core/components/dc_ui
