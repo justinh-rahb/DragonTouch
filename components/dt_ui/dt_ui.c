@@ -4202,8 +4202,18 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
     }
 
     if (s_ui.axes_text != NULL) {
-        lv_label_set_text_fmt(
-            s_ui.axes_text,
+        /*
+         * DT_AXES_NO_LVGL_FLOAT_FMT
+         *
+         * LVGL's printf wrapper is not built with reliable floating-point
+         * formatting in this firmware. Format with libc instead, then pass
+         * the finished string to LVGL.
+         */
+        char axes[128] = {0};
+
+        snprintf(
+            axes,
+            sizeof(axes),
             "X %.1f   Y %.1f   Z %.1f mm   Home %c%c%c",
             model->x,
             model->y,
@@ -4211,6 +4221,11 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
             model->homed_x ? 'X' : '-',
             model->homed_y ? 'Y' : '-',
             model->homed_z ? 'Z' : '-'
+        );
+
+        lv_label_set_text(
+            s_ui.axes_text,
+            axes
         );
     }
 

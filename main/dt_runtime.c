@@ -85,6 +85,7 @@ static void runtime_heap_diag(const char *where)
 #define DT_STATUS_PERIOD_MS   1000
 #define DT_HTTP_TIMEOUT_MS    3500
 #define DT_HTTP_RESPONSE_MAX  12288
+#define DT_HTTP_RESPONSE_LARGE_MAX 32768
 #define DT_ACTION_QUEUE_LEN   12
 #define DT_FILE_QUEUE_LEN     4
 #define DT_CAPABILITY_PERIOD_MS 30000
@@ -299,12 +300,13 @@ static void load_moonraker_config(void)
 }
 
 
-static esp_err_t http_request(
+static esp_err_t http_request_with_cap(
     esp_http_client_method_t method,
     const char *path,
     const char *json_body,
     char **response_out,
-    int *http_status_out
+    int *http_status_out,
+    size_t response_cap
 )
 {
     if (response_out != NULL) {
@@ -327,7 +329,7 @@ static esp_err_t http_request(
 
     char *response =
         heap_caps_malloc(
-            DT_HTTP_RESPONSE_MAX,
+            response_cap,
             MALLOC_CAP_SPIRAM |
             MALLOC_CAP_8BIT
         );
@@ -352,7 +354,7 @@ static esp_err_t http_request(
     http_buffer_t buffer = {
         .data = response,
         .len = 0,
-        .cap = DT_HTTP_RESPONSE_MAX,
+        .cap = response_cap,
     };
 
     response[0] = '\0';
@@ -448,6 +450,27 @@ static esp_err_t http_request(
 
     return ESP_OK;
 }
+
+static esp_err_t http_request(
+    esp_http_client_method_t method,
+    const char *path,
+    const char *json_body,
+    char **response_out,
+    int *http_status_out
+)
+{
+    return http_request_with_cap(
+        method,
+        path,
+        json_body,
+        response_out,
+        http_status_out,
+        DT_HTTP_RESPONSE_MAX
+    );
+}
+
+
+
 
 
 static cJSON *moonraker_payload(
@@ -746,7 +769,23 @@ static esp_err_t files_refresh_directory(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    s_files_model->online = s_base_url[0] != '\0';
+    /*
+     * DT_STAGE7C_LIVE_FILES_STATE
+     *
+     * "Configured" and "online" are different states. s_files_model->online
+     * is maintained only by the live status poll.
+     */
+    if (s_base_url[0] == '\0') {
+        s_files_model->online = false;
+        files_set_error("Printer is not configured");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!s_files_model->online) {
+        files_set_error("Printer offline");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     s_files_model->loading = true;
     s_files_model->error[0] = '\0';
     s_files_model->entry_count = 0;
@@ -758,11 +797,6 @@ static esp_err_t files_refresh_directory(void)
     );
 
     push_files_ui();
-
-    if (!s_files_model->online) {
-        files_set_error("Printer is not configured");
-        return ESP_ERR_INVALID_STATE;
-    }
 
     char encoded[640] = {0};
 
@@ -1175,6 +1209,13 @@ static esp_err_t files_handle_request(
         return ESP_ERR_INVALID_ARG;
     }
 
+    if (
+        request->request != DT_UI_FILE_REQUEST_REFRESH &&
+        !s_files_model->online
+    ) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     switch (request->request) {
     case DT_UI_FILE_REQUEST_REFRESH:
         return files_refresh_directory();
@@ -1347,6 +1388,70 @@ static bool json_object_has_key_ci(
 }
 
 
+
+
+
+/*
+ * DT_STAGE7A_LARGE_RAW_HELP
+ *
+ * /printer/gcode/help can be much larger than normal Moonraker responses.
+ * For AFC capability discovery we only need exact command-key presence, so
+ * keep the raw response in PSRAM and avoid constructing a large cJSON tree.
+ */
+static bool json_raw_has_object_key(
+    const char *json,
+    const char *key
+)
+{
+    if (json == NULL || key == NULL || key[0] == '\0') {
+        return false;
+    }
+
+    char token[96] = {0};
+
+    const int written = snprintf(
+        token,
+        sizeof(token),
+        "\"%s\"",
+        key
+    );
+
+    if (
+        written <= 0 ||
+        (size_t)written >= sizeof(token)
+    ) {
+        return false;
+    }
+
+    const size_t token_len = (size_t)written;
+    const char *cursor = json;
+
+    while (
+        (cursor = strstr(cursor, token)) != NULL
+    ) {
+        const char *after =
+            cursor + token_len;
+
+        while (
+            *after == ' ' ||
+            *after == '\t' ||
+            *after == '\r' ||
+            *after == '\n'
+        ) {
+            ++after;
+        }
+
+        if (*after == ':') {
+            return true;
+        }
+
+        cursor += token_len;
+    }
+
+    return false;
+}
+
+
 static esp_err_t discover_afc_registered_commands(void)
 {
     if (
@@ -1359,48 +1464,32 @@ static esp_err_t discover_afc_registered_commands(void)
     char *response = NULL;
 
     esp_err_t err =
-        http_request(
+        http_request_with_cap(
             HTTP_METHOD_GET,
             "/printer/gcode/help",
             NULL,
             &response,
-            NULL
+            NULL,
+            DT_HTTP_RESPONSE_LARGE_MAX
         );
 
     if (err != ESP_OK) {
         return err;
     }
 
-    cJSON *root =
-        cJSON_Parse(response);
-
-    free(response);
-
-    if (root == NULL) {
-        return ESP_FAIL;
-    }
-
-    cJSON *payload =
-        moonraker_payload(root);
-
-    if (!cJSON_IsObject(payload)) {
-        cJSON_Delete(root);
-        return ESP_FAIL;
-    }
-
     s_filament_model->has_afc_clear_message =
-        json_object_has_key_ci(
-            payload,
+        json_raw_has_object_key(
+            response,
             "AFC_CLEAR_MESSAGE"
         );
 
     s_filament_model->has_afc_lane_reset =
-        json_object_has_key_ci(
-            payload,
+        json_raw_has_object_key(
+            response,
             "AFC_LANE_RESET"
         );
 
-    cJSON_Delete(root);
+    free(response);
 
     return ESP_OK;
 }
@@ -2064,6 +2153,10 @@ static esp_err_t execute_afc_lane_request(
         return ESP_ERR_INVALID_ARG;
     }
 
+    if (!s_filament_model->online) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     char script[128] = {0};
 
     switch (request->request) {
@@ -2443,11 +2536,16 @@ static bool query_status(
             NULL
         );
 
+    /*
+     * DT_STAGE7B_CONNECTION_SEMANTICS
+     *
+     * A transport/request failure means Moonraker is unreachable: Offline.
+     * If Moonraker responds but Klippy is not ready, the webhooks-state path
+     * below continues to report Connecting.
+     */
     if (err != ESP_OK) {
         snap->connection =
-            s_base_url[0] != '\0'
-                ? DT_UI_CONNECTION_CONNECTING
-                : DT_UI_CONNECTION_OFFLINE;
+            DT_UI_CONNECTION_OFFLINE;
 
         snap->job =
             DT_UI_JOB_IDLE;
@@ -2786,6 +2884,29 @@ static bool query_status(
 }
 
 
+/*
+ * DT_STAGE7A_NAN_STABLE_SNAPSHOT
+ *
+ * NAN is an intentional sentinel for unavailable telemetry. Two NAN values
+ * therefore represent the same UI state and must compare equal.
+ */
+static bool runtime_float_equal(
+    float a,
+    float b
+)
+{
+    if (isnan(a) && isnan(b)) {
+        return true;
+    }
+
+    if (!isfinite(a) || !isfinite(b)) {
+        return a == b;
+    }
+
+    return fabsf(a - b) < 0.05f;
+}
+
+
 static bool snapshot_equal(
     const runtime_snapshot_t *a,
     const runtime_snapshot_t *b
@@ -2802,25 +2923,34 @@ static bool snapshot_equal(
             b->elapsed_seconds &&
         a->remaining_seconds ==
             b->remaining_seconds &&
-        fabsf(
-            a->nozzle_c -
+        runtime_float_equal(
+            a->nozzle_c,
             b->nozzle_c
-        ) < 0.05f &&
-        fabsf(
-            a->nozzle_target_c -
+        ) &&
+        runtime_float_equal(
+            a->nozzle_target_c,
             b->nozzle_target_c
-        ) < 0.05f &&
-        fabsf(
-            a->bed_c -
+        ) &&
+        runtime_float_equal(
+            a->bed_c,
             b->bed_c
-        ) < 0.05f &&
-        fabsf(
-            a->bed_target_c -
+        ) &&
+        runtime_float_equal(
+            a->bed_target_c,
             b->bed_target_c
-        ) < 0.05f &&
-        fabsf(a->x - b->x) < 0.05f &&
-        fabsf(a->y - b->y) < 0.05f &&
-        fabsf(a->z - b->z) < 0.05f &&
+        ) &&
+        runtime_float_equal(
+            a->x,
+            b->x
+        ) &&
+        runtime_float_equal(
+            a->y,
+            b->y
+        ) &&
+        runtime_float_equal(
+            a->z,
+            b->z
+        ) &&
         a->homed_x == b->homed_x &&
         a->homed_y == b->homed_y &&
         a->homed_z == b->homed_z &&
@@ -3019,6 +3149,13 @@ static esp_err_t start_selected_file(void)
     }
 
     if (
+        !s_have_previous ||
+        s_previous.connection != DT_UI_CONNECTION_ONLINE
+    ) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (
         s_have_previous &&
         (
             s_previous.job == DT_UI_JOB_PRINTING ||
@@ -3058,7 +3195,10 @@ static esp_err_t execute_filament_macro(
     bool load
 )
 {
-    if (s_filament_model == NULL) {
+    if (
+        s_filament_model == NULL ||
+        !s_filament_model->online
+    ) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -3087,6 +3227,23 @@ static esp_err_t execute_action(
     dt_ui_action_t action
 )
 {
+    /*
+     * DT_STAGE7C_ACTION_ONLINE_GUARD
+     *
+     * UI controls already disable printer actions when offline. This is the
+     * worker-side fail-closed guard for queued/stale input.
+     */
+    if (
+        action != DT_UI_ACTION_SYSTEM_REBOOT &&
+        action != DT_UI_ACTION_SYSTEM_FACTORY_RESET &&
+        (
+            !s_have_previous ||
+            s_previous.connection != DT_UI_CONNECTION_ONLINE
+        )
+    ) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     switch (action) {
     case DT_UI_ACTION_PAUSE:
         return post_endpoint(
@@ -3346,6 +3503,8 @@ static void runtime_task(void *arg)
     );
 
     unsigned failure_count = 0;
+    bool ever_online = false;
+    bool previous_online = false;
     TickType_t last_status =
         xTaskGetTickCount() -
         pdMS_TO_TICKS(DT_STATUS_PERIOD_MS);
@@ -3467,6 +3626,63 @@ static void runtime_task(void *arg)
 
             runtime_snapshot_t snap;
             const bool online = query_status(&snap);
+
+            /*
+             * DT_STAGE7B_REDISCOVER_ON_RECONNECT
+             *
+             * The initial capability discovery happens before the polling
+             * loop. After DragonTouch has been online once, any later
+             * offline/connecting -> online transition re-discovers printer
+             * objects and AFC commands so a Klippy/Moonraker restart cannot
+             * leave stale capabilities behind.
+             */
+            if (
+                online &&
+                !previous_online
+            ) {
+                if (
+                    ever_online &&
+                    s_filament_model != NULL
+                ) {
+                    ESP_LOGI(
+                        TAG,
+                        "printer reconnected; refreshing capabilities"
+                    );
+
+                    (void)discover_filament_capabilities();
+                }
+
+                ever_online = true;
+            }
+
+            previous_online = online;
+
+            if (s_files_model != NULL) {
+                const bool files_was_online =
+                    s_files_model->online;
+
+                s_files_model->online = online;
+
+                if (!online) {
+                    s_files_model->loading = false;
+
+                    snprintf(
+                        s_files_model->error,
+                        sizeof(s_files_model->error),
+                        "Printer offline"
+                    );
+
+                    if (files_was_online) {
+                        push_files_ui();
+                    }
+                } else if (!files_was_online) {
+                    /*
+                     * The file list may be stale after Moonraker/Klippy was
+                     * unavailable. Refresh the current directory once.
+                     */
+                    (void)files_refresh_directory();
+                }
+            }
 
             if (s_filament_model != NULL) {
                 s_filament_model->online = online;
