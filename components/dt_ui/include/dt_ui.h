@@ -94,6 +94,9 @@ typedef void (*dt_ui_file_request_handler_t)(
 typedef enum {
     DT_UI_FILAMENT_REQUEST_CHANGE_TOOL = 0,
     DT_UI_FILAMENT_REQUEST_EJECT_LANE,
+    DT_UI_FILAMENT_REQUEST_CLEAR_MESSAGE,
+    DT_UI_FILAMENT_REQUEST_RESET_LANE,
+    DT_UI_FILAMENT_REQUEST_RESUME,
 } dt_ui_filament_request_t;
 
 typedef struct {
@@ -132,6 +135,9 @@ typedef struct {
 
     bool has_bt_change_tool;
     bool has_bt_lane_eject;
+    bool has_bt_resume;
+    bool has_afc_clear_message;
+    bool has_afc_lane_reset;
 
     char load_macro[48];
     char unload_macro[48];
@@ -139,6 +145,8 @@ typedef struct {
 
     bool afc_error;
     bool afc_actions_enabled;
+    bool printer_printing;
+    bool printer_paused;
     char afc_state[32];
     char afc_current_load[24];
     char afc_message[192];

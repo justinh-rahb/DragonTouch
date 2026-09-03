@@ -1312,6 +1312,96 @@ static void push_filament_ui(void)
 }
 
 
+
+static bool json_object_has_key_ci(
+    cJSON *object,
+    const char *name
+)
+{
+    if (
+        !cJSON_IsObject(object) ||
+        name == NULL
+    ) {
+        return false;
+    }
+
+    cJSON *item = NULL;
+
+    cJSON_ArrayForEach(item, object) {
+        if (
+            item->string != NULL &&
+            strcasecmp(
+                item->string,
+                name
+            ) == 0
+        ) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+static esp_err_t discover_afc_registered_commands(void)
+{
+    if (
+        s_filament_model == NULL ||
+        !s_filament_model->afc_detected
+    ) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    char *response = NULL;
+
+    esp_err_t err =
+        http_request(
+            HTTP_METHOD_GET,
+            "/printer/gcode/help",
+            NULL,
+            &response,
+            NULL
+        );
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    cJSON *root =
+        cJSON_Parse(response);
+
+    free(response);
+
+    if (root == NULL) {
+        return ESP_FAIL;
+    }
+
+    cJSON *payload =
+        moonraker_payload(root);
+
+    if (!cJSON_IsObject(payload)) {
+        cJSON_Delete(root);
+        return ESP_FAIL;
+    }
+
+    s_filament_model->has_afc_clear_message =
+        json_object_has_key_ci(
+            payload,
+            "AFC_CLEAR_MESSAGE"
+        );
+
+    s_filament_model->has_afc_lane_reset =
+        json_object_has_key_ci(
+            payload,
+            "AFC_LANE_RESET"
+        );
+
+    cJSON_Delete(root);
+
+    return ESP_OK;
+}
+
+
 static esp_err_t discover_filament_capabilities(void)
 {
     if (s_filament_model == NULL) {
@@ -1366,6 +1456,9 @@ static esp_err_t discover_filament_capabilities(void)
     s_filament_model->toolchanger_detected = false;
     s_filament_model->has_bt_change_tool = false;
     s_filament_model->has_bt_lane_eject = false;
+    s_filament_model->has_bt_resume = false;
+    s_filament_model->has_afc_clear_message = false;
+    s_filament_model->has_afc_lane_reset = false;
     s_filament_model->load_macro[0] = '\0';
     s_filament_model->unload_macro[0] = '\0';
 
@@ -1511,11 +1604,21 @@ static esp_err_t discover_filament_capabilities(void)
         ) {
             s_filament_model->has_bt_lane_eject = true;
         }
+        else if (
+            strcasecmp(
+                macro,
+                "BT_RESUME"
+            ) == 0
+        ) {
+            s_filament_model->has_bt_resume = true;
+        }
     }
 
     cJSON_Delete(root);
 
     if (s_filament_model->afc_detected) {
+        (void)discover_afc_registered_commands();
+
         snprintf(
             s_filament_model->mode,
             sizeof(s_filament_model->mode),
@@ -1554,7 +1657,7 @@ static esp_err_t discover_filament_capabilities(void)
 
     ESP_LOGI(
         TAG,
-        "filament capabilities load=%d unload=%d m600=%d afc=%d mmu=%d toolchanger=%d bt_change=%d bt_eject=%d lanes=%u",
+        "filament capabilities load=%d unload=%d m600=%d afc=%d mmu=%d toolchanger=%d bt_change=%d bt_eject=%d bt_resume=%d clear=%d lane_reset=%d lanes=%u",
         s_filament_model->has_load_macro,
         s_filament_model->has_unload_macro,
         s_filament_model->has_m600,
@@ -1563,6 +1666,9 @@ static esp_err_t discover_filament_capabilities(void)
         s_filament_model->toolchanger_detected,
         s_filament_model->has_bt_change_tool,
         s_filament_model->has_bt_lane_eject,
+        s_filament_model->has_bt_resume,
+        s_filament_model->has_afc_clear_message,
+        s_filament_model->has_afc_lane_reset,
         (unsigned)s_afc_lane_object_count
     );
 
@@ -1912,9 +2018,15 @@ static esp_err_t query_afc_lane_state(
     s_filament_model->afc_lane_count =
         lane_count;
 
-    const bool print_active =
-        job_state == DT_UI_JOB_PRINTING ||
+    s_filament_model->printer_printing =
+        job_state == DT_UI_JOB_PRINTING;
+
+    s_filament_model->printer_paused =
         job_state == DT_UI_JOB_PAUSED;
+
+    const bool print_active =
+        s_filament_model->printer_printing ||
+        s_filament_model->printer_paused;
 
     const bool afc_idle =
         s_filament_model->afc_state[0] == '\0' ||
@@ -1943,22 +2055,21 @@ static esp_err_t execute_afc_lane_request(
 {
     if (
         request == NULL ||
-        s_filament_model == NULL ||
-        request->lane_number <= 0
+        s_filament_model == NULL
     ) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (!s_filament_model->afc_actions_enabled) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    char script[96] = {0};
+    char script[128] = {0};
 
     switch (request->request) {
     case DT_UI_FILAMENT_REQUEST_CHANGE_TOOL:
-        if (!s_filament_model->has_bt_change_tool) {
-            return ESP_ERR_NOT_SUPPORTED;
+        if (
+            request->lane_number <= 0 ||
+            !s_filament_model->afc_actions_enabled ||
+            !s_filament_model->has_bt_change_tool
+        ) {
+            return ESP_ERR_INVALID_STATE;
         }
 
         snprintf(
@@ -1970,8 +2081,12 @@ static esp_err_t execute_afc_lane_request(
         break;
 
     case DT_UI_FILAMENT_REQUEST_EJECT_LANE:
-        if (!s_filament_model->has_bt_lane_eject) {
-            return ESP_ERR_NOT_SUPPORTED;
+        if (
+            request->lane_number <= 0 ||
+            !s_filament_model->afc_actions_enabled ||
+            !s_filament_model->has_bt_lane_eject
+        ) {
+            return ESP_ERR_INVALID_STATE;
         }
 
         snprintf(
@@ -1982,13 +2097,92 @@ static esp_err_t execute_afc_lane_request(
         );
         break;
 
+    case DT_UI_FILAMENT_REQUEST_CLEAR_MESSAGE:
+        if (
+            !s_filament_model->has_afc_clear_message ||
+            s_filament_model->afc_message[0] == '\0'
+        ) {
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        snprintf(
+            script,
+            sizeof(script),
+            "AFC_CLEAR_MESSAGE"
+        );
+        break;
+
+    case DT_UI_FILAMENT_REQUEST_RESET_LANE: {
+        if (
+            request->lane_number <= 0 ||
+            s_filament_model->printer_printing ||
+            !s_filament_model->has_afc_lane_reset
+        ) {
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        const dt_ui_afc_lane_t *selected = NULL;
+
+        for (
+            size_t i = 0;
+            i < s_filament_model->afc_lane_count;
+            ++i
+        ) {
+            if (
+                s_filament_model->afc_lanes[i].lane_number ==
+                request->lane_number
+            ) {
+                selected =
+                    &s_filament_model->afc_lanes[i];
+                break;
+            }
+        }
+
+        if (
+            selected == NULL ||
+            selected->name[0] == '\0' ||
+            !(
+                selected->prep ||
+                selected->load ||
+                selected->loaded_to_hub ||
+                selected->tool_loaded
+            )
+        ) {
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        snprintf(
+            script,
+            sizeof(script),
+            "AFC_LANE_RESET LANE=%s",
+            selected->name
+        );
+        break;
+    }
+
+    case DT_UI_FILAMENT_REQUEST_RESUME:
+        if (
+            !s_filament_model->has_bt_resume ||
+            !s_filament_model->printer_paused ||
+            s_filament_model->afc_error
+        ) {
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        snprintf(
+            script,
+            sizeof(script),
+            "BT_RESUME"
+        );
+        break;
+
     default:
         return ESP_ERR_NOT_SUPPORTED;
     }
 
     ESP_LOGI(
         TAG,
-        "AFC lane request: %s",
+        "AFC request: %s",
         script
     );
 

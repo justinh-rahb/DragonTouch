@@ -100,6 +100,8 @@ typedef struct {
     lv_obj_t *afc_message_text;
     lv_obj_t *afc_previous_button;
     lv_obj_t *afc_next_button;
+    lv_obj_t *afc_clear_message_button;
+    lv_obj_t *afc_resume_button;
     lv_obj_t *afc_lane_rows[DT_UI_AFC_LANE_PAGE_SIZE];
     lv_obj_t *afc_lane_title[DT_UI_AFC_LANE_PAGE_SIZE];
     lv_obj_t *afc_lane_detail[DT_UI_AFC_LANE_PAGE_SIZE];
@@ -2012,24 +2014,59 @@ static void render_filament_model(void)
             detail
         );
 
+        const bool lane_has_filament_state =
+            lane->prep ||
+            lane->load ||
+            lane->loaded_to_hub ||
+            lane->tool_loaded;
+
+        const bool recovery_mode =
+            model->afc_error;
+
+        lv_obj_t *primary_label =
+            lv_obj_get_child(
+                s_ui.afc_lane_load_button[slot],
+                0
+            );
+
+        if (primary_label != NULL) {
+            lv_label_set_text(
+                primary_label,
+                recovery_mode
+                    ? "Reset"
+                    : "Load"
+            );
+        }
+
         const bool can_change =
+            !recovery_mode &&
             model->afc_actions_enabled &&
             model->has_bt_change_tool &&
             lane->prep;
 
+        /*
+         * Recovery reset is allowed while paused, but never while the
+         * printer is actively printing. AFC itself remains authoritative
+         * over whether the selected lane can actually be reset.
+         */
+        const bool can_reset =
+            recovery_mode &&
+            model->online &&
+            !model->printer_printing &&
+            model->has_afc_lane_reset &&
+            lane_has_filament_state;
+
         const bool can_eject =
+            !recovery_mode &&
             model->afc_actions_enabled &&
             model->has_bt_lane_eject &&
-            (
-                lane->prep ||
-                lane->load ||
-                lane->loaded_to_hub ||
-                lane->tool_loaded
-            );
+            lane_has_filament_state;
 
         set_button_enabled(
             s_ui.afc_lane_load_button[slot],
-            can_change
+            recovery_mode
+                ? can_reset
+                : can_change
         );
 
         set_button_enabled(
@@ -2050,6 +2087,21 @@ static void render_filament_model(void)
             s_ui.afc_lane_offset +
                 DT_UI_AFC_LANE_PAGE_SIZE <
             model->afc_lane_count
+    );
+
+    set_button_enabled(
+        s_ui.afc_clear_message_button,
+        afc_mode &&
+            model->has_afc_clear_message &&
+            model->afc_message[0] != '\0'
+    );
+
+    set_button_enabled(
+        s_ui.afc_resume_button,
+        afc_mode &&
+            model->has_bt_resume &&
+            model->printer_paused &&
+            !model->afc_error
     );
 
     set_button_enabled(
@@ -2141,6 +2193,35 @@ static void show_afc_confirmation(
 }
 
 
+/*
+ * DT_STAGE5_AFC_RECOVERY
+ */
+static void afc_clear_message_event(lv_event_t *event)
+{
+    (void)event;
+
+    dispatch_filament_request(
+        DT_UI_FILAMENT_REQUEST_CLEAR_MESSAGE,
+        0
+    );
+}
+
+
+static void afc_resume_event(lv_event_t *event)
+{
+    (void)event;
+
+    show_afc_confirmation(
+        DT_UI_FILAMENT_REQUEST_RESUME,
+        0,
+        "Resume after AFC recovery?",
+        "Run BT_RESUME? AFC will restore its saved recovery "
+        "position and resume the paused print.",
+        "Resume print"
+    );
+}
+
+
 static int afc_lane_for_slot(size_t slot)
 {
     const size_t index =
@@ -2165,14 +2246,47 @@ static void afc_lane_load_event(lv_event_t *event)
         (size_t)(uintptr_t)
         lv_event_get_user_data(event);
 
-    const int lane =
-        afc_lane_for_slot(slot);
+    const size_t index =
+        s_ui.afc_lane_offset + slot;
 
-    if (lane <= 0) {
+    if (
+        index >= s_ui.filament_model.afc_lane_count
+    ) {
         return;
     }
 
-    char body[192] = {0};
+    const dt_ui_afc_lane_t *lane =
+        &s_ui.filament_model.afc_lanes[index];
+
+    const int lane_number =
+        lane->lane_number;
+
+    if (lane_number <= 0) {
+        return;
+    }
+
+    char body[224] = {0};
+
+    if (s_ui.filament_model.afc_error) {
+        snprintf(
+            body,
+            sizeof(body),
+            "Run AFC_LANE_RESET LANE=%s?\n"
+            "AFC will reset this lane back toward the hub "
+            "using its configured/default reset distance.",
+            lane->name
+        );
+
+        show_afc_confirmation(
+            DT_UI_FILAMENT_REQUEST_RESET_LANE,
+            lane_number,
+            "Reset AFC lane?",
+            body,
+            "Reset lane"
+        );
+
+        return;
+    }
 
     snprintf(
         body,
@@ -2180,12 +2294,12 @@ static void afc_lane_load_event(lv_event_t *event)
         "Run BT_CHANGE_TOOL LANE=%d?\n"
         "AFC will unload the current lane if necessary "
         "and load the selected lane.",
-        lane
+        lane_number
     );
 
     show_afc_confirmation(
         DT_UI_FILAMENT_REQUEST_CHANGE_TOOL,
-        lane,
+        lane_number,
         "Load AFC lane?",
         body,
         "Change tool"
@@ -2491,6 +2605,73 @@ static void create_filament_page(lv_obj_t *page)
     lv_obj_set_width(
         s_ui.afc_message_text,
         LV_PCT(100)
+    );
+
+    lv_obj_t *recovery_row =
+        lv_obj_create(card);
+
+    lv_obj_remove_style_all(
+        recovery_row
+    );
+
+    lv_obj_set_size(
+        recovery_row,
+        LV_PCT(100),
+        34
+    );
+
+    lv_obj_set_layout(
+        recovery_row,
+        LV_LAYOUT_FLEX
+    );
+
+    lv_obj_set_flex_flow(
+        recovery_row,
+        LV_FLEX_FLOW_ROW
+    );
+
+    lv_obj_set_style_pad_column(
+        recovery_row,
+        8,
+        0
+    );
+
+    s_ui.afc_clear_message_button =
+        make_action(
+            recovery_row,
+            "Clear AFC message",
+            false
+        );
+
+    s_ui.afc_resume_button =
+        make_action(
+            recovery_row,
+            "Resume",
+            true
+        );
+
+    lv_obj_set_height(
+        s_ui.afc_clear_message_button,
+        32
+    );
+
+    lv_obj_set_height(
+        s_ui.afc_resume_button,
+        32
+    );
+
+    lv_obj_add_event_cb(
+        s_ui.afc_clear_message_button,
+        afc_clear_message_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    lv_obj_add_event_cb(
+        s_ui.afc_resume_button,
+        afc_resume_event,
+        LV_EVENT_CLICKED,
+        NULL
     );
 
     s_ui.filament_nozzle_text =
@@ -2901,6 +3082,8 @@ static void recycle_secondary_pages(
             s_ui.afc_message_text = NULL;
             s_ui.afc_previous_button = NULL;
             s_ui.afc_next_button = NULL;
+            s_ui.afc_clear_message_button = NULL;
+            s_ui.afc_resume_button = NULL;
 
             for (
                 size_t slot = 0;
