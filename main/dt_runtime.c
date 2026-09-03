@@ -3219,6 +3219,9 @@ static esp_err_t execute_action(
         esp_restart();
         return ESP_OK;
 
+    case DT_UI_ACTION_SYSTEM_FACTORY_RESET:
+        return dt_portal_factory_reset_from_ui();
+
     default:
         return ESP_ERR_NOT_SUPPORTED;
     }

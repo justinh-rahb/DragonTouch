@@ -214,6 +214,7 @@ typedef enum {
     DT_UI_ACTION_FILAMENT_LOAD,
     DT_UI_ACTION_FILAMENT_UNLOAD,
     DT_UI_ACTION_SYSTEM_REBOOT,
+    DT_UI_ACTION_SYSTEM_FACTORY_RESET,
 } dt_ui_action_t;
 
 typedef void (*dt_ui_action_handler_t)(

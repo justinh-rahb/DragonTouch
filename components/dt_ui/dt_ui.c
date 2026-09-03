@@ -97,7 +97,9 @@ typedef struct {
     lv_obj_t *settings_build_text;
     lv_obj_t *settings_memory_text;
     lv_obj_t *settings_portal_text;
+    lv_obj_t *settings_update_text;
     lv_obj_t *settings_reboot_button;
+    lv_obj_t *settings_factory_reset_button;
 
     lv_obj_t *filament_mode_text;
     lv_obj_t *filament_capability_text;
@@ -561,6 +563,17 @@ static const dt_confirmation_t CONFIRM_SYSTEM_REBOOT = {
     "Reboot",
     false,
     DT_UI_ACTION_SYSTEM_REBOOT,
+};
+
+
+static const dt_confirmation_t CONFIRM_SYSTEM_FACTORY_RESET = {
+    "Factory reset DragonTouch?",
+    "This clears DragonTouch Wi-Fi credentials and Moonraker configuration, "
+    "then reboots into the setup access point. It does NOT reset Klipper or "
+    "erase printer configuration.",
+    "Factory reset",
+    true,
+    DT_UI_ACTION_SYSTEM_FACTORY_RESET,
 };
 
 
@@ -2507,6 +2520,35 @@ static void render_system_model(void)
         );
     }
 
+
+    if (s_ui.settings_update_text != NULL) {
+        char update[224] = {0};
+
+        if (model->local_ip[0] != '\0') {
+            snprintf(
+                update,
+                sizeof(update),
+                "Browser-assisted OTA:\n"
+                "http://%s/setup\n"
+                "Upload the DragonTouch application .bin there.",
+                model->local_ip
+            );
+        } else {
+            snprintf(
+                update,
+                sizeof(update),
+                "Browser-assisted OTA:\n"
+                "http://192.168.4.1/setup\n"
+                "Upload the DragonTouch application .bin there."
+            );
+        }
+
+        lv_label_set_text(
+            s_ui.settings_update_text,
+            update
+        );
+    }
+
     /*
      * DT_STAGE6_NULL_SAFE_REBOOT_BUTTON
      *
@@ -2520,11 +2562,85 @@ static void render_system_model(void)
             true
         );
     }
+
+
+    if (s_ui.settings_factory_reset_button != NULL) {
+        set_button_enabled(
+            s_ui.settings_factory_reset_button,
+            true
+        );
+    }
+}
+
+
+/*
+ * DT_STAGE6_PAGE_SCROLL_SYSTEM_CARDS
+ *
+ * Devices and Settings use page-level scrolling. Their individual cards
+ * should size themselves to their contents and must never become nested
+ * scroll containers.
+ */
+static void fit_system_card_to_content(lv_obj_t *card)
+{
+    if (card == NULL) {
+        return;
+    }
+
+    lv_obj_set_width(
+        card,
+        LV_PCT(100)
+    );
+
+    lv_obj_set_height(
+        card,
+        LV_SIZE_CONTENT
+    );
+
+    lv_obj_set_flex_grow(
+        card,
+        0
+    );
+
+    lv_obj_remove_flag(
+        card,
+        LV_OBJ_FLAG_SCROLLABLE
+    );
+
+    lv_obj_set_scrollbar_mode(
+        card,
+        LV_SCROLLBAR_MODE_OFF
+    );
+}
+
+
+static void enable_system_page_scrolling(lv_obj_t *page)
+{
+    if (page == NULL) {
+        return;
+    }
+
+    lv_obj_add_flag(
+        page,
+        LV_OBJ_FLAG_SCROLLABLE
+    );
+
+    lv_obj_set_scroll_dir(
+        page,
+        LV_DIR_VER
+    );
+
+    lv_obj_set_scrollbar_mode(
+        page,
+        LV_SCROLLBAR_MODE_AUTO
+    );
 }
 
 
 static void create_devices_page(lv_obj_t *page)
 {
+    enable_system_page_scrolling(page);
+
+    /* DT_STAGE6_FULL_WIDTH_SYSTEM_CARDS */
     create_page_heading(
         page,
         "Devices",
@@ -2537,6 +2653,10 @@ static void create_devices_page(lv_obj_t *page)
             "PRINTER",
             "Waiting for runtime status..."
         );
+
+    fit_system_card_to_content(
+        printer
+    );
 
     s_ui.devices_printer_text =
         lv_obj_get_child(
@@ -2561,6 +2681,10 @@ static void create_devices_page(lv_obj_t *page)
             "Waiting for Wi-Fi status..."
         );
 
+    fit_system_card_to_content(
+        network
+    );
+
     s_ui.devices_network_text =
         lv_obj_get_child(
             network,
@@ -2584,6 +2708,10 @@ static void create_devices_page(lv_obj_t *page)
             "Waiting for capability discovery..."
         );
 
+    fit_system_card_to_content(
+        filament
+    );
+
     s_ui.devices_filament_text =
         lv_obj_get_child(
             filament,
@@ -2606,6 +2734,10 @@ static void create_devices_page(lv_obj_t *page)
 
 static void create_settings_page(lv_obj_t *page)
 {
+    enable_system_page_scrolling(page);
+
+    /* DT_STAGE6B_MAINTENANCE */
+
     create_page_heading(
         page,
         "Settings",
@@ -2618,6 +2750,10 @@ static void create_settings_page(lv_obj_t *page)
             "SOFTWARE",
             "Version unavailable"
         );
+
+    fit_system_card_to_content(
+        build
+    );
 
     s_ui.settings_build_text =
         lv_obj_get_child(
@@ -2632,6 +2768,10 @@ static void create_settings_page(lv_obj_t *page)
             "Heap diagnostics unavailable"
         );
 
+    fit_system_card_to_content(
+        memory
+    );
+
     s_ui.settings_memory_text =
         lv_obj_get_child(
             memory,
@@ -2644,6 +2784,10 @@ static void create_settings_page(lv_obj_t *page)
             "WEB CONFIGURATION",
             "Printer setup URL unavailable"
         );
+
+    fit_system_card_to_content(
+        portal
+    );
 
     s_ui.settings_portal_text =
         lv_obj_get_child(
@@ -2670,6 +2814,55 @@ static void create_settings_page(lv_obj_t *page)
 
     size_card_action(
         s_ui.settings_reboot_button
+    );
+
+    lv_obj_t *update =
+        make_control_card(
+            page,
+            "FIRMWARE UPDATE",
+            "Browser-assisted OTA URL unavailable"
+        );
+
+    fit_system_card_to_content(
+        update
+    );
+
+    s_ui.settings_update_text =
+        lv_obj_get_child(
+            update,
+            1
+        );
+
+    lv_label_set_long_mode(
+        s_ui.settings_update_text,
+        LV_LABEL_LONG_MODE_WRAP
+    );
+
+    lv_obj_set_width(
+        s_ui.settings_update_text,
+        LV_PCT(100)
+    );
+
+    lv_obj_t *danger =
+        make_control_card(
+            page,
+            "MAINTENANCE",
+            "Factory reset affects DragonTouch connectivity only."
+        );
+
+    fit_system_card_to_content(
+        danger
+    );
+
+    s_ui.settings_factory_reset_button =
+        make_guarded_action(
+            danger,
+            "Factory reset",
+            &CONFIRM_SYSTEM_FACTORY_RESET
+        );
+
+    size_card_action(
+        s_ui.settings_factory_reset_button
     );
 
     render_system_model();
@@ -3408,7 +3601,9 @@ static void recycle_secondary_pages(
             s_ui.settings_build_text = NULL;
             s_ui.settings_memory_text = NULL;
             s_ui.settings_portal_text = NULL;
+            s_ui.settings_update_text = NULL;
             s_ui.settings_reboot_button = NULL;
+            s_ui.settings_factory_reset_button = NULL;
         }
 
         s_ui.page_built[page] =

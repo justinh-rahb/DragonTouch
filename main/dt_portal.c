@@ -10,6 +10,7 @@
 #include "cJSON.h"
 
 #include "dc_moonraker.h"
+#include "dc_wifi.h"
 #include "dc_portal.h"
 
 #include "esp_http_server.h"
@@ -424,9 +425,156 @@ static esp_err_t product_factory_reset(void *ctx)
 }
 
 
+
+
+/*
+ * DT_STAGE6B_PORTAL_RESET_REUSE
+ *
+ * The shared dc_portal reset endpoint performs:
+ *   product factory reset -> dc_wifi_clear_creds -> reboot.
+ *
+ * The touchscreen has no authenticated HTTP session/token of its own, so
+ * invoke those same public reset primitives directly rather than creating
+ * a second NVS implementation or bypassing the product reset callback.
+ */
+esp_err_t dt_portal_factory_reset_from_ui(void)
+{
+    ESP_LOGW(
+        TAG,
+        "factory reset requested from touchscreen"
+    );
+
+    esp_err_t err =
+        product_factory_reset(NULL);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err =
+        dc_wifi_clear_creds();
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    vTaskDelay(
+        pdMS_TO_TICKS(300)
+    );
+
+    esp_restart();
+
+    return ESP_OK;
+}
+
+
+
+/*
+ * DT_PORTAL_HOME_PAGE
+ *
+ * DragonTouch's web root is a navigation hub. Operational browser surfaces
+ * remain separate so each can stay small and purpose-built.
+ */
+static esp_err_t home_get(httpd_req_t *req)
+{
+    static const char page[] =
+        "<!doctype html>"
+        "<html lang=\"en\">"
+        "<head>"
+        "<meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<meta name=\"color-scheme\" content=\"light dark\">"
+        "<title>DragonTouch</title>"
+        "<style>"
+        ":root{color-scheme:light dark;"
+        "--bg:light-dark(#f5f5f5,#171717);"
+        "--card:light-dark(#fff,#242424);"
+        "--fg:light-dark(#18181b,#f4f4f5);"
+        "--muted:light-dark(#71717a,#a1a1aa);"
+        "--border:light-dark(#d4d4d8,#3f3f46);"
+        "--accent:light-dark(#2563eb,#60a5fa);}"
+        "*{box-sizing:border-box}"
+        "body{margin:0;font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;"
+        "background:var(--bg);color:var(--fg)}"
+        "main{width:min(760px,calc(100% - 32px));margin:0 auto;padding:36px 0 48px}"
+        "header{margin-bottom:24px}"
+        "h1{font-size:30px;line-height:1.1;margin:0 0 8px}"
+        "header p{margin:0;color:var(--muted);font-size:15px}"
+        ".grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}"
+        ".card{display:flex;flex-direction:column;min-height:170px;padding:18px;"
+        "border:1px solid var(--border);border-radius:12px;background:var(--card);"
+        "color:inherit;text-decoration:none;transition:transform .12s ease,border-color .12s ease}"
+        ".card:hover{transform:translateY(-2px);border-color:var(--accent)}"
+        ".card:focus-visible{outline:2px solid var(--accent);outline-offset:2px}"
+        ".eyebrow{font-size:11px;font-weight:700;letter-spacing:.08em;"
+        "text-transform:uppercase;color:var(--accent);margin-bottom:8px}"
+        ".card h2{font-size:19px;margin:0 0 8px}"
+        ".card p{font-size:14px;line-height:1.45;color:var(--muted);margin:0 0 16px}"
+        ".go{margin-top:auto;font-size:14px;font-weight:600;color:var(--accent)}"
+        "footer{margin-top:20px;color:var(--muted);font-size:12px}"
+        "@media(max-width:650px){.grid{grid-template-columns:1fr}.card{min-height:0}}"
+        "</style>"
+        "</head>"
+        "<body>"
+        "<main>"
+        "<header>"
+        "<h1>DragonTouch</h1>"
+        "<p>Printer control display and configuration.</p>"
+        "</header>"
+        "<section class=\"grid\">"
+        "<a class=\"card\" href=\"/dragontouch\">"
+        "<span class=\"eyebrow\">Printer</span>"
+        "<h2>Printer &amp; Connection</h2>"
+        "<p>Configure the Moonraker connection and DragonTouch printer settings.</p>"
+        "<span class=\"go\">Open printer setup &rarr;</span>"
+        "</a>"
+        "<a class=\"card\" href=\"/setup\">"
+        "<span class=\"eyebrow\">Device</span>"
+        "<h2>Device Setup &amp; Firmware</h2>"
+        "<p>Manage Wi-Fi, fallback access point, firmware updates, logs and recovery.</p>"
+        "<span class=\"go\">Open device setup &rarr;</span>"
+        "</a>"
+        "<a class=\"card\" href=\"/console\">"
+        "<span class=\"eyebrow\">Diagnostics</span>"
+        "<h2>Console</h2>"
+        "<p>View the live DragonTouch firmware log for diagnostics and troubleshooting.</p>"
+        "<span class=\"go\">Open console &rarr;</span>"
+        "</a>"
+        "</section>"
+        "<footer>DragonTouch local web interface</footer>"
+        "</main>"
+        "</body>"
+        "</html>";
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
+}
+
+
 static const httpd_uri_t PRODUCT_ROUTES[] = {
     {
+        .uri = "/home",
+        .method = HTTP_GET,
+        .handler = home_get,
+        .user_ctx = NULL,
+    },
+    {
         .uri = "/dragontouch",
+        .method = HTTP_GET,
+        .handler = page_get,
+        .user_ctx = NULL,
+    },
+    /*
+     * DT_PORTAL_SETTINGS_ALIAS
+     *
+     * /settings is not a DragonTouch API. Without an explicit product route it
+     * falls through dc_portal's wildcard SPA route, whose legacy compatibility
+     * surface defaults to DragonBreath when no DragonTouch API-v2 descriptor
+     * exists. Route it to the DragonTouch setup page instead.
+     */
+    {
+        .uri = "/settings",
         .method = HTTP_GET,
         .handler = page_get,
         .user_ctx = NULL,
@@ -451,6 +599,7 @@ esp_err_t dt_portal_start(void)
     const dc_portal_config_t config = {
         .product = "dragontouch",
         .display_name = "DragonTouch",
+        .root_redirect = "/home",
         .product_routes = PRODUCT_ROUTES,
         .product_route_count =
             sizeof(PRODUCT_ROUTES) / sizeof(PRODUCT_ROUTES[0]),
