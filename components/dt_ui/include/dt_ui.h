@@ -33,37 +33,81 @@ typedef enum {
     DT_UI_PAGE_SETTINGS,
 } dt_ui_page_t;
 
+typedef enum {
+    DT_UI_ACTION_PAUSE = 0,
+    DT_UI_ACTION_RESUME,
+    DT_UI_ACTION_CANCEL,
+
+    DT_UI_ACTION_HOME_ALL,
+
+    DT_UI_ACTION_JOG_X_NEG,
+    DT_UI_ACTION_JOG_X_POS,
+    DT_UI_ACTION_JOG_Y_NEG,
+    DT_UI_ACTION_JOG_Y_POS,
+    DT_UI_ACTION_JOG_Z_NEG,
+    DT_UI_ACTION_JOG_Z_POS,
+
+    DT_UI_ACTION_NOZZLE_220,
+
+    DT_UI_ACTION_BED_OFF,
+    DT_UI_ACTION_BED_60,
+    DT_UI_ACTION_BED_100,
+
+    DT_UI_ACTION_EXTRUDE_10,
+    DT_UI_ACTION_RETRACT_10,
+
+    DT_UI_ACTION_FAN_OFF,
+    DT_UI_ACTION_FAN_50,
+    DT_UI_ACTION_FAN_100,
+} dt_ui_action_t;
+
+typedef void (*dt_ui_action_handler_t)(
+    dt_ui_action_t action,
+    void *ctx
+);
+
 typedef struct {
     const char *device_name;
     dt_ui_connection_t connection;
     dt_ui_job_state_t job_state;
+
     const char *filename;
     uint8_t progress_percent;
     uint32_t elapsed_seconds;
     uint32_t remaining_seconds;
+
     float nozzle_c;
     float nozzle_target_c;
     float bed_c;
     float bed_target_c;
     uint8_t fan_percent;
+
+    float x;
+    float y;
+    float z;
+    bool homed_x;
+    bool homed_y;
+    bool homed_z;
+
     bool can_pause;
     bool can_resume;
     bool can_cancel;
+
+    bool can_home;
+    bool can_jog;
+    bool can_heat;
+    bool can_extrude;
+    bool can_fan;
 } dt_ui_model_t;
 
-/**
- * Create the DragonTouch shell on an initialized LVGL display.
- *
- * The caller owns LVGL initialization, display registration, tick delivery, and
- * locking. No hardware command callbacks are installed by this component yet.
- */
 esp_err_t dt_ui_create(lv_display_t *display);
-
-/** Update the passive dashboard view. Call while holding the LVGL lock. */
 esp_err_t dt_ui_update(const dt_ui_model_t *model);
-
-/** Select a primary surface. Useful to restore navigation state and drive host previews. */
 esp_err_t dt_ui_show_page(dt_ui_page_t page);
+
+esp_err_t dt_ui_set_action_handler(
+    dt_ui_action_handler_t handler,
+    void *ctx
+);
 
 #ifdef __cplusplus
 }

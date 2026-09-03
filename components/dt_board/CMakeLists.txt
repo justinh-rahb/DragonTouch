@@ -6,7 +6,10 @@ idf_component_register(
     INCLUDE_DIRS
         "include"
 
-    REQUIRES
+    REQUIRES esp_lvgl_port
         esp_lcd
         driver
+        esp_timer
+        heap
+        lvgl
 )

@@ -1,9 +1,17 @@
 #include "dt_ui.h"
 
 #include <stdio.h>
+#include <math.h>
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
+
+#ifndef DT_UI_HOST_PREVIEW
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#endif
 
 #define DT_COLOR_BACKGROUND 0x181818
 #define DT_COLOR_SURFACE    0x222222
@@ -58,11 +66,60 @@ typedef struct {
     lv_obj_t *dialog_body;
     lv_obj_t *dialog_confirm;
     lv_obj_t *dialog_confirm_label;
+
+    lv_obj_t *home_button;
+    lv_obj_t *heat_button;
+    lv_obj_t *extrude_button;
+    lv_obj_t *retract_button;
+
+    lv_obj_t *jog_buttons[6];
+    lv_obj_t *bed_buttons[3];
+    lv_obj_t *fan_buttons[3];
+
+    lv_obj_t *axes_text;
+    lv_obj_t *nozzle_control_text;
+    lv_obj_t *bed_control_text;
+    lv_obj_t *fan_control_text;
+
+    dt_ui_job_state_t current_job_state;
+
+    /*
+     * DT_UI_LAZY_PAGE_BUILD
+     *
+     * Page containers always exist, but only Home is populated during boot.
+     * Other pages are populated on first visit.
+     */
+    bool page_built[DT_PAGE_COUNT];
+
     bool ready;
 } dt_ui_state_t;
 
 static const char *TAG = "dt_ui";
+
+/*
+ * UI_BUILD_WATCHDOG_FIX
+ *
+ * During startup app_main owns the LVGL lock while the full
+ * object tree is constructed. Stage 2 contains enough objects
+ * that uninterrupted construction can starve IDLE0 for longer
+ * than the task watchdog period.
+ *
+ * Yielding one scheduler tick between major page builds lets
+ * IDLE0 service the watchdog. The LVGL task cannot alter this
+ * tree because app_main still owns the LVGL mutex.
+ */
+static void ui_build_yield(void)
+{
+#ifndef DT_UI_HOST_PREVIEW
+    vTaskDelay(1);
+#endif
+}
+
 static dt_ui_state_t s_ui;
+
+static dt_ui_action_handler_t s_action_handler;
+static void *s_action_ctx;
+static dt_ui_action_t s_pending_action;
 
 static lv_color_t color(uint32_t hex)
 {
@@ -183,9 +240,31 @@ static lv_obj_t *make_nav_icon(lv_obj_t *parent, dt_nav_icon_t type)
 {
     lv_obj_t *icon = lv_obj_create(parent);
     lv_obj_remove_style_all(icon);
+
+    /*
+     * Decorative nav icons must never consume pointer input.
+     *
+     * lv_obj_create() creates a CLICKABLE base object by default.
+     * Without removing that flag, touches landing directly on the
+     * 22x22 icon target the icon instead of the parent nav button,
+     * so the parent's LV_EVENT_CLICKED callback never runs.
+     */
+    lv_obj_remove_flag(
+        icon,
+        LV_OBJ_FLAG_CLICKABLE |
+        LV_OBJ_FLAG_CLICK_FOCUSABLE |
+        LV_OBJ_FLAG_SCROLLABLE
+    );
+
     lv_obj_set_size(icon, 22, 22);
     lv_obj_set_style_text_color(icon, color(DT_COLOR_MUTED), 0);
-    lv_obj_add_event_cb(icon, nav_icon_draw, LV_EVENT_DRAW_MAIN, (void *)(uintptr_t)type);
+    lv_obj_add_event_cb(
+        icon,
+        nav_icon_draw,
+        LV_EVENT_DRAW_MAIN,
+        (void *)(uintptr_t)type
+    );
+
     return icon;
 }
 
@@ -204,6 +283,14 @@ static lv_obj_t *make_label(lv_obj_t *parent, const char *text, uint32_t color_h
     lv_obj_t *label = lv_label_create(parent);
     lv_label_set_text(label, text);
     lv_obj_set_style_text_color(label, color(color_hex), 0);
+
+    lv_obj_remove_flag(
+        label,
+        LV_OBJ_FLAG_CLICKABLE |
+        LV_OBJ_FLAG_CLICK_FOCUSABLE |
+        LV_OBJ_FLAG_SCROLLABLE
+    );
+
     return label;
 }
 
@@ -254,27 +341,89 @@ static void set_button_enabled(lv_obj_t *button, bool enabled)
     }
 }
 
+static void ensure_page_built(dt_ui_page_t page);
+static void recycle_secondary_pages(dt_ui_page_t keep);
+
 static void show_page(dt_ui_page_t selected)
 {
+    if (
+        selected < DT_UI_PAGE_HOME ||
+        selected > DT_UI_PAGE_SETTINGS
+    ) {
+        return;
+    }
+
+    /*
+     * DT_UI_RECYCLE_SECONDARY_PAGES
+     *
+     * Home is permanently resident. Keep at most one secondary page's
+     * content tree alive. This bounds LVGL's resident object/style
+     * allocation instead of allowing every visited page to accumulate.
+     */
+    recycle_secondary_pages(selected);
+
+    ensure_page_built(selected);
+
     for (int i = 0; i < DT_PAGE_COUNT; ++i) {
-        const bool active = i == selected;
+        const bool active =
+            i == selected;
+
         if (active) {
-            lv_obj_remove_flag(s_ui.pages[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(
+                s_ui.pages[i],
+                LV_OBJ_FLAG_HIDDEN
+            );
         } else {
-            lv_obj_add_flag(s_ui.pages[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(
+                s_ui.pages[i],
+                LV_OBJ_FLAG_HIDDEN
+            );
         }
-        lv_obj_set_style_text_color(s_ui.nav_icons[i],
-                                    color(active ? DT_COLOR_ACCENT : DT_COLOR_MUTED), 0);
-        lv_obj_set_style_bg_opa(s_ui.nav_buttons[i], active ? LV_OPA_20 : LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(s_ui.nav_buttons[i], active ? 3 : 0, 0);
-        lv_obj_set_style_border_side(s_ui.nav_buttons[i], LV_BORDER_SIDE_LEFT, 0);
-        lv_obj_set_style_border_color(s_ui.nav_buttons[i], color(DT_COLOR_ACCENT), 0);
+
+        lv_obj_set_style_text_color(
+            s_ui.nav_icons[i],
+            color(
+                active
+                    ? DT_COLOR_ACCENT
+                    : DT_COLOR_MUTED
+            ),
+            0
+        );
+
+        lv_obj_set_style_bg_opa(
+            s_ui.nav_buttons[i],
+            active
+                ? LV_OPA_20
+                : LV_OPA_TRANSP,
+            0
+        );
+
+        lv_obj_set_style_border_width(
+            s_ui.nav_buttons[i],
+            active ? 3 : 0,
+            0
+        );
+
+        lv_obj_set_style_border_side(
+            s_ui.nav_buttons[i],
+            LV_BORDER_SIDE_LEFT,
+            0
+        );
+
+        lv_obj_set_style_border_color(
+            s_ui.nav_buttons[i],
+            color(DT_COLOR_ACCENT),
+            0
+        );
     }
 }
 
 static void nav_event(lv_event_t *event)
 {
-    dt_ui_page_t page = (dt_ui_page_t)(uintptr_t)lv_event_get_user_data(event);
+    dt_ui_page_t page =
+        (dt_ui_page_t)(uintptr_t)
+        lv_event_get_user_data(event);
+
     show_page(page);
 }
 
@@ -283,59 +432,188 @@ typedef struct {
     const char *body;
     const char *confirm_label;
     bool destructive;
+    dt_ui_action_t action;
 } dt_confirmation_t;
 
 static const dt_confirmation_t CONFIRM_CANCEL = {
     "Stop this print?",
-    "The printer remains authoritative. Stopping cannot be undone and requires an attached command handler.",
+    "Stopping cannot be undone. Moonraker will request the printer to cancel the active job.",
     "Stop print",
     true,
+    DT_UI_ACTION_CANCEL,
 };
+
 static const dt_confirmation_t CONFIRM_HOME = {
     "Home all axes?",
-    "The printer will validate its motion state and safety policy before accepting this request.",
-    "Request homing",
+    "The printer will execute G28. Keep the motion envelope clear.",
+    "Home all axes",
     false,
+    DT_UI_ACTION_HOME_ALL,
 };
+
 static const dt_confirmation_t CONFIRM_HEAT = {
     "Set nozzle to 220 °C?",
-    "Heating is performed and supervised by the printer. Keep the tool area clear.",
-    "Request heating",
+    "The printer remains authoritative over heater safety and limits.",
+    "Set 220 °C",
     false,
+    DT_UI_ACTION_NOZZLE_220,
 };
+
 static const dt_confirmation_t CONFIRM_EXTRUDE = {
     "Extrude 10 mm?",
-    "The printer must confirm a safe nozzle temperature before moving filament.",
-    "Request extrusion",
+    "Klipper will reject the request if the active extruder is below its minimum extrusion temperature.",
+    "Extrude 10 mm",
     false,
+    DT_UI_ACTION_EXTRUDE_10,
 };
+
+static const dt_confirmation_t CONFIRM_RETRACT = {
+    "Retract 10 mm?",
+    "Klipper will reject the request if the active extruder is below its minimum extrusion temperature.",
+    "Retract 10 mm",
+    false,
+    DT_UI_ACTION_RETRACT_10,
+};
+
+
+static void dispatch_action(dt_ui_action_t action)
+{
+    if (s_action_handler != NULL) {
+        s_action_handler(action, s_action_ctx);
+    }
+}
+
+
+static void direct_action_event(lv_event_t *event)
+{
+    dispatch_action(
+        (dt_ui_action_t)(uintptr_t)
+        lv_event_get_user_data(event)
+    );
+}
+
+
+static void pause_resume_event(lv_event_t *event)
+{
+    (void)event;
+
+    dispatch_action(
+        s_ui.current_job_state == DT_UI_JOB_PAUSED
+            ? DT_UI_ACTION_RESUME
+            : DT_UI_ACTION_PAUSE
+    );
+}
+
+
+static lv_obj_t *make_direct_action(
+    lv_obj_t *parent,
+    const char *text,
+    dt_ui_action_t action
+)
+{
+    lv_obj_t *button =
+        make_action(parent, text, false);
+
+    lv_obj_add_event_cb(
+        button,
+        direct_action_event,
+        LV_EVENT_CLICKED,
+        (void *)(uintptr_t)action
+    );
+
+    return button;
+}
+
 
 static void close_dialog(lv_event_t *event)
 {
     (void)event;
-    lv_obj_add_flag(s_ui.dialog_scrim, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(
+        s_ui.dialog_scrim,
+        LV_OBJ_FLAG_HIDDEN
+    );
 }
 
-static void show_confirmation(const dt_confirmation_t *confirmation)
+
+static void confirm_dialog_event(lv_event_t *event)
 {
-    lv_label_set_text(s_ui.dialog_title, confirmation->title);
-    lv_label_set_text(s_ui.dialog_body, confirmation->body);
-    lv_label_set_text(s_ui.dialog_confirm_label, confirmation->confirm_label);
-    lv_obj_set_style_bg_color(s_ui.dialog_confirm,
-                              color(confirmation->destructive ? DT_COLOR_WARNING : DT_COLOR_ACCENT), 0);
-    lv_obj_set_style_text_color(s_ui.dialog_confirm_label, color(DT_COLOR_TEXT), 0);
-    set_button_enabled(s_ui.dialog_confirm, false);
-    lv_obj_remove_flag(s_ui.dialog_scrim, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(s_ui.dialog_scrim);
+    (void)event;
+
+    dispatch_action(s_pending_action);
+
+    lv_obj_add_flag(
+        s_ui.dialog_scrim,
+        LV_OBJ_FLAG_HIDDEN
+    );
 }
+
+
+static void show_confirmation(
+    const dt_confirmation_t *confirmation
+)
+{
+    s_pending_action =
+        confirmation->action;
+
+    lv_label_set_text(
+        s_ui.dialog_title,
+        confirmation->title
+    );
+
+    lv_label_set_text(
+        s_ui.dialog_body,
+        confirmation->body
+    );
+
+    lv_label_set_text(
+        s_ui.dialog_confirm_label,
+        confirmation->confirm_label
+    );
+
+    lv_obj_set_style_bg_color(
+        s_ui.dialog_confirm,
+        color(
+            confirmation->destructive
+                ? DT_COLOR_WARNING
+                : DT_COLOR_ACCENT
+        ),
+        0
+    );
+
+    lv_obj_set_style_text_color(
+        s_ui.dialog_confirm_label,
+        color(DT_COLOR_TEXT),
+        0
+    );
+
+    set_button_enabled(
+        s_ui.dialog_confirm,
+        s_action_handler != NULL
+    );
+
+    lv_obj_remove_flag(
+        s_ui.dialog_scrim,
+        LV_OBJ_FLAG_HIDDEN
+    );
+
+    lv_obj_move_foreground(
+        s_ui.dialog_scrim
+    );
+}
+
 
 static void open_dialog(lv_event_t *event)
 {
-    show_confirmation(lv_event_get_user_data(event));
+    show_confirmation(
+        lv_event_get_user_data(event)
+    );
 }
 
+
 #ifdef DT_UI_HOST_PREVIEW
-void dt_ui_preview_show_confirmation(const char *name)
+void dt_ui_preview_show_confirmation(
+    const char *name
+)
 {
     if (strcmp(name, "cancel") == 0) {
         show_confirmation(&CONFIRM_CANCEL);
@@ -349,13 +627,26 @@ void dt_ui_preview_show_confirmation(const char *name)
 }
 #endif
 
-static lv_obj_t *make_guarded_action(lv_obj_t *parent, const char *text,
-                                     const dt_confirmation_t *confirmation)
+
+static lv_obj_t *make_guarded_action(
+    lv_obj_t *parent,
+    const char *text,
+    const dt_confirmation_t *confirmation
+)
 {
-    lv_obj_t *button = make_action(parent, text, false);
-    lv_obj_add_event_cb(button, open_dialog, LV_EVENT_CLICKED, (void *)confirmation);
+    lv_obj_t *button =
+        make_action(parent, text, false);
+
+    lv_obj_add_event_cb(
+        button,
+        open_dialog,
+        LV_EVENT_CLICKED,
+        (void *)confirmation
+    );
+
     return button;
 }
+
 
 static void size_card_action(lv_obj_t *button)
 {
@@ -422,9 +713,23 @@ static void create_home_page(lv_obj_t *page)
     lv_obj_set_style_pad_column(actions, 8, 0);
     s_ui.pause_button = make_action(actions, "Pause", true);
     s_ui.pause_label = lv_obj_get_child(s_ui.pause_button, 0);
+
+    lv_obj_add_event_cb(
+        s_ui.pause_button,
+        pause_resume_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
     s_ui.cancel_button = make_action(actions, "Cancel", false);
     style_destructive_action(s_ui.cancel_button);
-    lv_obj_add_event_cb(s_ui.cancel_button, open_dialog, LV_EVENT_CLICKED, (void *)&CONFIRM_CANCEL);
+
+    lv_obj_add_event_cb(
+        s_ui.cancel_button,
+        open_dialog,
+        LV_EVENT_CLICKED,
+        (void *)&CONFIRM_CANCEL
+    );
     set_button_enabled(s_ui.pause_button, false);
     set_button_enabled(s_ui.cancel_button, false);
 
@@ -463,32 +768,191 @@ static void create_home_page(lv_obj_t *page)
     s_ui.printer_hint = make_label(printer, "Pair a same-LAN device to begin.", DT_COLOR_MUTED);
 }
 
-static void create_stub_page(lv_obj_t *page, const char *title, const char *description,
-                             const char *const *cards, size_t card_count)
+static void create_stub_page(
+    lv_obj_t *page,
+    const char *title,
+    const char *description,
+    const char *const *cards,
+    size_t card_count
+)
 {
-    lv_obj_set_layout(page, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
-    lv_obj_t *heading = make_label(page, title, DT_COLOR_TEXT);
-    lv_obj_set_style_text_font(heading, &lv_font_montserrat_20, 0);
-    make_label(page, description, DT_COLOR_MUTED);
+    /*
+     * DT_UI_STUB_GRID_FIX
+     *
+     * Avoid wrapping flex rows with fixed-width children that also
+     * flex-grow. Settings is the first stub with four cards and is
+     * therefore the first page that crosses onto a second flex line.
+     *
+     * A two-column grid has deterministic geometry and avoids that
+     * flex-wrap path entirely.
+     */
+    static int32_t col_dsc[] = {
+        LV_GRID_FR(1),
+        LV_GRID_FR(1),
+        LV_GRID_TEMPLATE_LAST
+    };
 
-    lv_obj_t *grid = lv_obj_create(page);
+    static int32_t row_dsc[] = {
+        116,
+        116,
+        116,
+        116,
+        LV_GRID_TEMPLATE_LAST
+    };
+
+    lv_obj_set_layout(
+        page,
+        LV_LAYOUT_FLEX
+    );
+
+    lv_obj_set_flex_flow(
+        page,
+        LV_FLEX_FLOW_COLUMN
+    );
+
+    lv_obj_t *heading =
+        make_label(
+            page,
+            title,
+            DT_COLOR_TEXT
+        );
+
+    lv_obj_set_style_text_font(
+        heading,
+        &lv_font_montserrat_20,
+        0
+    );
+
+    lv_obj_t *body =
+        make_label(
+            page,
+            description,
+            DT_COLOR_MUTED
+        );
+
+    lv_label_set_long_mode(
+        body,
+        LV_LABEL_LONG_MODE_WRAP
+    );
+
+    lv_obj_set_width(
+        body,
+        LV_PCT(100)
+    );
+
+    lv_obj_t *grid =
+        lv_obj_create(page);
+
     lv_obj_remove_style_all(grid);
-    lv_obj_set_width(grid, LV_PCT(100));
-    lv_obj_set_flex_grow(grid, 1);
-    lv_obj_set_layout(grid, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_style_pad_row(grid, 10, 0);
-    lv_obj_set_style_pad_column(grid, 10, 0);
 
-    for (size_t i = 0; i < card_count; ++i) {
-        lv_obj_t *card = make_card(grid, cards[i]);
-        lv_obj_set_size(card, 220, 116);
-        lv_obj_set_flex_grow(card, 1);
-        make_label(card, "Available after printer pairing", DT_COLOR_MUTED);
-        lv_obj_t *button = make_action(card, "Unavailable", false);
-        lv_obj_set_width(button, LV_PCT(100));
-        set_button_enabled(button, false);
+    lv_obj_set_width(
+        grid,
+        LV_PCT(100)
+    );
+
+    lv_obj_set_flex_grow(
+        grid,
+        1
+    );
+
+    lv_obj_set_layout(
+        grid,
+        LV_LAYOUT_GRID
+    );
+
+    lv_obj_set_grid_dsc_array(
+        grid,
+        col_dsc,
+        row_dsc
+    );
+
+    lv_obj_set_style_pad_row(
+        grid,
+        10,
+        0
+    );
+
+    lv_obj_set_style_pad_column(
+        grid,
+        10,
+        0
+    );
+
+    for (
+        size_t i = 0;
+        i < card_count;
+        ++i
+    ) {
+        const int32_t col =
+            (int32_t)(i % 2);
+
+        const int32_t row =
+            (int32_t)(i / 2);
+
+        if (row >= 4) {
+            ESP_LOGW(
+                TAG,
+                "stub page '%s' has too many cards: %u",
+                title,
+                (unsigned)card_count
+            );
+            break;
+        }
+
+        lv_obj_t *card =
+            make_card(
+                grid,
+                cards[i]
+            );
+
+        lv_obj_set_grid_cell(
+            card,
+            LV_GRID_ALIGN_STRETCH,
+            col,
+            1,
+            LV_GRID_ALIGN_STRETCH,
+            row,
+            1
+        );
+
+        lv_obj_t *availability =
+            make_label(
+                card,
+                "Available after printer pairing",
+                DT_COLOR_MUTED
+            );
+
+        lv_label_set_long_mode(
+            availability,
+            LV_LABEL_LONG_MODE_WRAP
+        );
+
+        lv_obj_set_width(
+            availability,
+            LV_PCT(100)
+        );
+
+        lv_obj_t *button =
+            make_action(
+                card,
+                "Unavailable",
+                false
+            );
+
+        lv_obj_set_width(
+            button,
+            LV_PCT(100)
+        );
+
+        lv_obj_set_flex_grow(
+            button,
+            0
+        );
+
+        set_button_enabled(
+            button,
+            false
+        );
     }
 }
 
@@ -568,48 +1032,319 @@ static lv_obj_t *make_control_card(lv_obj_t *parent, const char *title, const ch
 
 static void create_control_page(lv_obj_t *page)
 {
-    static const char *names[] = {"Motion", "Temperature", "Extrusion", "Fans"};
+    static const char *names[] = {
+        "Motion",
+        "Temperature",
+        "Extrusion",
+        "Fans"
+    };
+
     lv_obj_t *tabs = create_page_heading(
-        page, "Control", "Capability-gated requests; the selected printer owns safety decisions.");
-    for (size_t i = 0; i < DT_CONTROL_TAB_COUNT; ++i) {
-        s_ui.control_tabs[i] = create_tab(tabs, names[i], control_tab_event, i);
-        s_ui.control_panels[i] = create_tab_panel(page);
+        page,
+        "Control",
+        "Commands are sent asynchronously through Moonraker."
+    );
+
+    for (
+        size_t i = 0;
+        i < DT_CONTROL_TAB_COUNT;
+        ++i
+    ) {
+        s_ui.control_tabs[i] =
+            create_tab(
+                tabs,
+                names[i],
+                control_tab_event,
+                i
+            );
+
+        s_ui.control_panels[i] =
+            create_tab_panel(page);
     }
 
-    lv_obj_t *motion = make_control_card(s_ui.control_panels[0], "AXES", "X 120.0   Y 95.5   Z 12.4 mm");
-    lv_obj_t *home = make_guarded_action(motion, "Review home all", &CONFIRM_HOME);
-    size_card_action(home);
-    lv_obj_t *motion_hint = make_label(
-        motion, "Jog controls unavailable: no motion capability handler.", DT_COLOR_MUTED);
-    lv_label_set_long_mode(motion_hint, LV_LABEL_LONG_MODE_WRAP);
-    lv_obj_set_width(motion_hint, LV_PCT(100));
-    lv_obj_t *jog = make_control_card(s_ui.control_panels[0], "JOG DISTANCE", "0.1 mm   1 mm   10 mm");
-    lv_obj_t *jog_button = make_action(jog, "Jog pad unavailable", false);
-    size_card_action(jog_button);
-    set_button_enabled(jog_button, false);
+    /*
+     * MOTION
+     */
+    lv_obj_t *motion =
+        make_control_card(
+            s_ui.control_panels[0],
+            "AXES",
+            "Position unavailable"
+        );
 
-    lv_obj_t *nozzle = make_control_card(s_ui.control_panels[1], "NOZZLE", "Current 219.6 °C   Target 220 °C");
-    lv_obj_t *heat = make_guarded_action(nozzle, "Review 220 °C", &CONFIRM_HEAT);
-    size_card_action(heat);
-    lv_obj_t *bed = make_control_card(s_ui.control_panels[1], "BED", "Current 59.8 °C   Target 60 °C");
-    lv_obj_t *bed_button = make_action(bed, "Temperature presets unavailable", false);
-    size_card_action(bed_button);
-    set_button_enabled(bed_button, false);
+    s_ui.axes_text =
+        lv_obj_get_child(motion, 1);
 
-    lv_obj_t *extrude = make_control_card(s_ui.control_panels[2], "ACTIVE TOOL", "Tool 0   PLA   10 mm request");
-    lv_obj_t *extrude_button = make_guarded_action(extrude, "Review extrude 10 mm", &CONFIRM_EXTRUDE);
-    size_card_action(extrude_button);
-    lv_obj_t *retract = make_control_card(s_ui.control_panels[2], "RETRACT", "Requires an explicit extrusion capability and safe temperature.");
-    lv_obj_t *retract_button = make_action(retract, "Unavailable", false);
-    size_card_action(retract_button);
-    set_button_enabled(retract_button, false);
+    s_ui.home_button =
+        make_guarded_action(
+            motion,
+            "Home all axes",
+            &CONFIRM_HOME
+        );
 
-    lv_obj_t *part_fan = make_control_card(s_ui.control_panels[3], "PART FAN", "78%   Authoritative state from printer");
-    lv_obj_t *fan_button = make_action(part_fan, "Fan controls unavailable", false);
-    size_card_action(fan_button);
-    set_button_enabled(fan_button, false);
-    make_control_card(s_ui.control_panels[3], "AUXILIARY FANS", "No declared auxiliary fan capabilities.");
-    select_tab(s_ui.control_tabs, s_ui.control_panels, DT_CONTROL_TAB_COUNT, 0);
+    size_card_action(
+        s_ui.home_button
+    );
+
+    lv_obj_t *jog =
+        make_control_card(
+            s_ui.control_panels[0],
+            "JOG",
+            "XY ±10 mm   Z ±1 mm"
+        );
+
+    lv_obj_t *jog_row =
+        lv_obj_create(jog);
+
+    lv_obj_remove_style_all(jog_row);
+    lv_obj_set_size(
+        jog_row,
+        LV_PCT(100),
+        84
+    );
+    lv_obj_set_layout(
+        jog_row,
+        LV_LAYOUT_FLEX
+    );
+    lv_obj_set_flex_flow(
+        jog_row,
+        LV_FLEX_FLOW_ROW_WRAP
+    );
+    lv_obj_set_style_pad_row(
+        jog_row,
+        4,
+        0
+    );
+    lv_obj_set_style_pad_column(
+        jog_row,
+        4,
+        0
+    );
+
+    static const char *jog_names[] = {
+        "X -",
+        "X +",
+        "Y -",
+        "Y +",
+        "Z -",
+        "Z +"
+    };
+
+    static const dt_ui_action_t jog_actions[] = {
+        DT_UI_ACTION_JOG_X_NEG,
+        DT_UI_ACTION_JOG_X_POS,
+        DT_UI_ACTION_JOG_Y_NEG,
+        DT_UI_ACTION_JOG_Y_POS,
+        DT_UI_ACTION_JOG_Z_NEG,
+        DT_UI_ACTION_JOG_Z_POS
+    };
+
+    for (size_t i = 0; i < 6; ++i) {
+        s_ui.jog_buttons[i] =
+            make_direct_action(
+                jog_row,
+                jog_names[i],
+                jog_actions[i]
+            );
+
+        lv_obj_set_size(
+            s_ui.jog_buttons[i],
+            92,
+            38
+        );
+
+        lv_obj_set_flex_grow(
+            s_ui.jog_buttons[i],
+            0
+        );
+    }
+
+    /*
+     * TEMPERATURE
+     */
+    lv_obj_t *nozzle =
+        make_control_card(
+            s_ui.control_panels[1],
+            "NOZZLE",
+            "Unavailable"
+        );
+
+    s_ui.nozzle_control_text =
+        lv_obj_get_child(nozzle, 1);
+
+    s_ui.heat_button =
+        make_guarded_action(
+            nozzle,
+            "Set 220 °C",
+            &CONFIRM_HEAT
+        );
+
+    size_card_action(
+        s_ui.heat_button
+    );
+
+    lv_obj_t *bed =
+        make_control_card(
+            s_ui.control_panels[1],
+            "BED",
+            "Unavailable"
+        );
+
+    s_ui.bed_control_text =
+        lv_obj_get_child(bed, 1);
+
+    lv_obj_t *bed_row =
+        lv_obj_create(bed);
+
+    lv_obj_remove_style_all(bed_row);
+    lv_obj_set_size(
+        bed_row,
+        LV_PCT(100),
+        42
+    );
+    lv_obj_set_layout(
+        bed_row,
+        LV_LAYOUT_FLEX
+    );
+    lv_obj_set_flex_flow(
+        bed_row,
+        LV_FLEX_FLOW_ROW
+    );
+    lv_obj_set_style_pad_column(
+        bed_row,
+        4,
+        0
+    );
+
+    static const char *bed_names[] = {
+        "Off",
+        "60 °C",
+        "100 °C"
+    };
+
+    static const dt_ui_action_t bed_actions[] = {
+        DT_UI_ACTION_BED_OFF,
+        DT_UI_ACTION_BED_60,
+        DT_UI_ACTION_BED_100
+    };
+
+    for (size_t i = 0; i < 3; ++i) {
+        s_ui.bed_buttons[i] =
+            make_direct_action(
+                bed_row,
+                bed_names[i],
+                bed_actions[i]
+            );
+    }
+
+    /*
+     * EXTRUSION
+     */
+    lv_obj_t *extrude =
+        make_control_card(
+            s_ui.control_panels[2],
+            "ACTIVE EXTRUDER",
+            "10 mm manual move"
+        );
+
+    s_ui.extrude_button =
+        make_guarded_action(
+            extrude,
+            "Extrude 10 mm",
+            &CONFIRM_EXTRUDE
+        );
+
+    size_card_action(
+        s_ui.extrude_button
+    );
+
+    lv_obj_t *retract =
+        make_control_card(
+            s_ui.control_panels[2],
+            "RETRACT",
+            "10 mm manual move"
+        );
+
+    s_ui.retract_button =
+        make_guarded_action(
+            retract,
+            "Retract 10 mm",
+            &CONFIRM_RETRACT
+        );
+
+    size_card_action(
+        s_ui.retract_button
+    );
+
+    /*
+     * FAN
+     */
+    lv_obj_t *part_fan =
+        make_control_card(
+            s_ui.control_panels[3],
+            "PART FAN",
+            "Unavailable"
+        );
+
+    s_ui.fan_control_text =
+        lv_obj_get_child(part_fan, 1);
+
+    lv_obj_t *fan_row =
+        lv_obj_create(part_fan);
+
+    lv_obj_remove_style_all(fan_row);
+    lv_obj_set_size(
+        fan_row,
+        LV_PCT(100),
+        42
+    );
+    lv_obj_set_layout(
+        fan_row,
+        LV_LAYOUT_FLEX
+    );
+    lv_obj_set_flex_flow(
+        fan_row,
+        LV_FLEX_FLOW_ROW
+    );
+    lv_obj_set_style_pad_column(
+        fan_row,
+        4,
+        0
+    );
+
+    static const char *fan_names[] = {
+        "Off",
+        "50%",
+        "100%"
+    };
+
+    static const dt_ui_action_t fan_actions[] = {
+        DT_UI_ACTION_FAN_OFF,
+        DT_UI_ACTION_FAN_50,
+        DT_UI_ACTION_FAN_100
+    };
+
+    for (size_t i = 0; i < 3; ++i) {
+        s_ui.fan_buttons[i] =
+            make_direct_action(
+                fan_row,
+                fan_names[i],
+                fan_actions[i]
+            );
+    }
+
+    make_control_card(
+        s_ui.control_panels[3],
+        "AUXILIARY FANS",
+        "Printer-specific auxiliary fan discovery comes in the device-capability layer."
+    );
+
+    select_tab(
+        s_ui.control_tabs,
+        s_ui.control_panels,
+        DT_CONTROL_TAB_COUNT,
+        0
+    );
 }
 
 static void create_files_page(lv_obj_t *page)
@@ -644,30 +1379,275 @@ static void create_files_page(lv_obj_t *page)
     select_tab(s_ui.file_tabs, s_ui.file_panels, DT_FILES_TAB_COUNT, 0);
 }
 
-static void create_pages(lv_obj_t *content)
+
+
+static void log_ui_heap(
+    const char *phase,
+    dt_ui_page_t page
+)
 {
-    for (int i = 0; i < DT_PAGE_COUNT; ++i) {
-        s_ui.pages[i] = make_page(content);
+    const size_t internal_free =
+        heap_caps_get_free_size(
+            MALLOC_CAP_INTERNAL |
+            MALLOC_CAP_8BIT
+        );
+
+    const size_t internal_largest =
+        heap_caps_get_largest_free_block(
+            MALLOC_CAP_INTERNAL |
+            MALLOC_CAP_8BIT
+        );
+
+    const size_t psram_free =
+        heap_caps_get_free_size(
+            MALLOC_CAP_SPIRAM |
+            MALLOC_CAP_8BIT
+        );
+
+    ESP_LOGI(
+        TAG,
+        "UI_HEAP %s page=%d internal=%u largest=%u psram=%u",
+        phase,
+        (int)page,
+        (unsigned)internal_free,
+        (unsigned)internal_largest,
+        (unsigned)psram_free
+    );
+}
+
+
+static void clear_recycled_page_refs(
+    dt_ui_page_t page
+)
+{
+    if (page != DT_UI_PAGE_CONTROL) {
+        return;
     }
 
-    create_home_page(s_ui.pages[DT_UI_PAGE_HOME]);
-    create_control_page(s_ui.pages[DT_UI_PAGE_CONTROL]);
-    create_files_page(s_ui.pages[DT_UI_PAGE_FILES]);
+    s_ui.home_button = NULL;
+    s_ui.heat_button = NULL;
+    s_ui.extrude_button = NULL;
+    s_ui.retract_button = NULL;
 
-    static const char *filament_cards[] = {"ACTIVE TOOL", "MATERIAL SLOTS", "LOAD / UNLOAD"};
-    create_stub_page(s_ui.pages[DT_UI_PAGE_FILAMENT], "Filament",
-                     "Tool and material controls adapt to the selected printer's capabilities.",
-                     filament_cards, 3);
+    s_ui.axes_text = NULL;
+    s_ui.nozzle_control_text = NULL;
+    s_ui.bed_control_text = NULL;
+    s_ui.fan_control_text = NULL;
 
-    static const char *device_cards[] = {"SELECTED PRINTER", "DISCOVERED DEVICES", "DRAGON GROUP"};
-    create_stub_page(s_ui.pages[DT_UI_PAGE_DEVICES], "Devices",
-                     "Discover and explicitly pair same-LAN printers and Dragon-family siblings.",
-                     device_cards, 3);
+    for (size_t i = 0; i < 6; ++i) {
+        s_ui.jog_buttons[i] = NULL;
+    }
 
-    static const char *settings_cards[] = {"WI-FI", "DISPLAY", "UPDATE & RECOVERY", "ABOUT"};
-    create_stub_page(s_ui.pages[DT_UI_PAGE_SETTINGS], "Settings",
-                     "Device-local preferences, provisioning, diagnostics, and recovery.",
-                     settings_cards, 4);
+    for (size_t i = 0; i < 3; ++i) {
+        s_ui.bed_buttons[i] = NULL;
+        s_ui.fan_buttons[i] = NULL;
+    }
+
+    for (
+        size_t i = 0;
+        i < DT_CONTROL_TAB_COUNT;
+        ++i
+    ) {
+        s_ui.control_tabs[i] = NULL;
+        s_ui.control_panels[i] = NULL;
+    }
+}
+
+
+static void recycle_secondary_pages(
+    dt_ui_page_t keep
+)
+{
+    for (
+        int i = DT_UI_PAGE_CONTROL;
+        i <= DT_UI_PAGE_SETTINGS;
+        ++i
+    ) {
+        const dt_ui_page_t page =
+            (dt_ui_page_t)i;
+
+        if (
+            page == keep ||
+            !s_ui.page_built[page]
+        ) {
+            continue;
+        }
+
+        log_ui_heap(
+            "before-clean",
+            page
+        );
+
+        lv_obj_clean(
+            s_ui.pages[page]
+        );
+
+        clear_recycled_page_refs(
+            page
+        );
+
+        s_ui.page_built[page] =
+            false;
+
+        log_ui_heap(
+            "after-clean",
+            page
+        );
+    }
+}
+
+
+static void ensure_page_built(dt_ui_page_t page)
+{
+    if (
+        page < DT_UI_PAGE_HOME ||
+        page > DT_UI_PAGE_SETTINGS
+    ) {
+        return;
+    }
+
+    if (s_ui.page_built[page]) {
+        return;
+    }
+
+    const int64_t started_us = esp_timer_get_time();
+
+    log_ui_heap(
+        "before-build",
+        page
+    );
+
+    ESP_LOGI(
+        TAG,
+        "lazy build page=%d start",
+        (int)page
+    );
+
+    switch (page) {
+    case DT_UI_PAGE_HOME:
+        create_home_page(
+            s_ui.pages[DT_UI_PAGE_HOME]
+        );
+        break;
+
+    case DT_UI_PAGE_CONTROL:
+        create_control_page(
+            s_ui.pages[DT_UI_PAGE_CONTROL]
+        );
+        break;
+
+    case DT_UI_PAGE_FILES:
+        create_files_page(
+            s_ui.pages[DT_UI_PAGE_FILES]
+        );
+        break;
+
+    case DT_UI_PAGE_FILAMENT: {
+        static const char *cards[] = {
+            "ACTIVE TOOL",
+            "MATERIAL SLOTS",
+            "LOAD / UNLOAD"
+        };
+
+        create_stub_page(
+            s_ui.pages[DT_UI_PAGE_FILAMENT],
+            "Filament",
+            "Tool and material controls adapt "
+            "to the selected printer's capabilities.",
+            cards,
+            3
+        );
+        break;
+    }
+
+    case DT_UI_PAGE_DEVICES: {
+        static const char *cards[] = {
+            "SELECTED PRINTER",
+            "DISCOVERED DEVICES",
+            "DRAGON GROUP"
+        };
+
+        create_stub_page(
+            s_ui.pages[DT_UI_PAGE_DEVICES],
+            "Devices",
+            "Discover and explicitly pair "
+            "same-LAN printers and Dragon-family siblings.",
+            cards,
+            3
+        );
+        break;
+    }
+
+    case DT_UI_PAGE_SETTINGS: {
+        static const char *cards[] = {
+            "WI-FI",
+            "DISPLAY",
+            "UPDATE & RECOVERY",
+            "ABOUT"
+        };
+
+        create_stub_page(
+            s_ui.pages[DT_UI_PAGE_SETTINGS],
+            "Settings",
+            "Device-local preferences, provisioning, "
+            "diagnostics, and recovery.",
+            cards,
+            4
+        );
+        break;
+    }
+
+    default:
+        return;
+    }
+
+    s_ui.page_built[page] = true;
+
+    ESP_LOGI(
+        TAG,
+        "lazy build page=%d complete in %lld ms",
+        (int)page,
+        (long long)(
+            (
+                esp_timer_get_time() -
+                started_us
+            ) / 1000
+        )
+    );
+
+    log_ui_heap(
+        "after-build",
+        page
+    );
+}
+
+static void create_pages(lv_obj_t *content)
+{
+    ESP_LOGI(
+        TAG,
+        "lazy page mode: creating containers"
+    );
+
+    for (int i = 0; i < DT_PAGE_COUNT; ++i) {
+        s_ui.pages[i] = make_page(content);
+
+        lv_obj_add_flag(
+            s_ui.pages[i],
+            LV_OBJ_FLAG_HIDDEN
+        );
+    }
+
+    /*
+     * Home is the only full page tree constructed synchronously at boot.
+     */
+    ensure_page_built(
+        DT_UI_PAGE_HOME
+    );
+
+    ESP_LOGI(
+        TAG,
+        "lazy page mode: boot page complete"
+    );
 }
 
 static void create_dialog_overlay(void)
@@ -706,7 +1686,18 @@ static void create_dialog_overlay(void)
     lv_obj_add_event_cb(back, close_dialog, LV_EVENT_CLICKED, NULL);
     s_ui.dialog_confirm = make_action(actions, "Request", true);
     s_ui.dialog_confirm_label = lv_obj_get_child(s_ui.dialog_confirm, 0);
-    set_button_enabled(s_ui.dialog_confirm, false);
+
+    lv_obj_add_event_cb(
+        s_ui.dialog_confirm,
+        confirm_dialog_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    set_button_enabled(
+        s_ui.dialog_confirm,
+        false
+    );
     lv_obj_add_flag(s_ui.dialog_scrim, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -874,63 +1865,353 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
     if (!s_ui.ready) {
         return ESP_ERR_INVALID_STATE;
     }
+
     if (model == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    lv_label_set_text(s_ui.device_name,
-                      model->device_name != NULL ? model->device_name : "No printer");
-    const bool has_device = model->device_name != NULL && model->device_name[0] != '\0';
-    lv_label_set_text(s_ui.printer_name, has_device ? model->device_name : "No paired printer");
-    lv_label_set_text(s_ui.printer_hint,
-                      has_device ? "Selected same-LAN printer" : "Pair a same-LAN device to begin.");
-    const char *connection = "Offline";
-    uint32_t connection_color = DT_COLOR_MUTED;
-    if (model->connection == DT_UI_CONNECTION_CONNECTING) {
-        connection = "Connecting";
-        connection_color = DT_COLOR_WARNING;
-    } else if (model->connection == DT_UI_CONNECTION_ONLINE) {
-        connection = "Online";
-        connection_color = DT_COLOR_SUCCESS;
-    }
-    lv_label_set_text(s_ui.connection_text, connection);
-    lv_obj_set_style_bg_color(s_ui.connection_dot, color(connection_color), 0);
+    s_ui.current_job_state =
+        model->job_state;
 
-    lv_label_set_text(s_ui.job_state, job_state_text(model->job_state));
-    lv_obj_set_style_text_color(s_ui.job_state,
-                                color(model->job_state == DT_UI_JOB_ERROR
-                                          ? DT_COLOR_WARNING : DT_COLOR_TEXT), 0);
-    lv_label_set_text(s_ui.filename,
-                      model->filename != NULL && model->filename[0] != '\0'
-                          ? model->filename : "No active file");
-    uint8_t progress = model->progress_percent > 100 ? 100 : model->progress_percent;
-    lv_bar_set_value(s_ui.progress, progress, LV_ANIM_OFF);
-    lv_label_set_text_fmt(s_ui.progress_text, "%u%%", progress);
+    lv_label_set_text(
+        s_ui.device_name,
+        model->device_name != NULL
+            ? model->device_name
+            : "No printer"
+    );
+
+    const bool has_device =
+        model->device_name != NULL &&
+        model->device_name[0] != '\0';
+
+    lv_label_set_text(
+        s_ui.printer_name,
+        has_device
+            ? model->device_name
+            : "No paired printer"
+    );
+
+    lv_label_set_text(
+        s_ui.printer_hint,
+        has_device
+            ? "Selected same-LAN printer"
+            : "Pair a same-LAN device to begin."
+    );
+
+    const char *connection = "Offline";
+    uint32_t connection_color =
+        DT_COLOR_MUTED;
+
+    if (
+        model->connection ==
+        DT_UI_CONNECTION_CONNECTING
+    ) {
+        connection = "Connecting";
+        connection_color =
+            DT_COLOR_WARNING;
+
+    } else if (
+        model->connection ==
+        DT_UI_CONNECTION_ONLINE
+    ) {
+        connection = "Online";
+        connection_color =
+            DT_COLOR_SUCCESS;
+    }
+
+    lv_label_set_text(
+        s_ui.connection_text,
+        connection
+    );
+
+    lv_obj_set_style_bg_color(
+        s_ui.connection_dot,
+        color(connection_color),
+        0
+    );
+
+    lv_label_set_text(
+        s_ui.job_state,
+        job_state_text(
+            model->job_state
+        )
+    );
+
+    lv_obj_set_style_text_color(
+        s_ui.job_state,
+        color(
+            model->job_state ==
+                DT_UI_JOB_ERROR
+                ? DT_COLOR_WARNING
+                : DT_COLOR_TEXT
+        ),
+        0
+    );
+
+    lv_label_set_text(
+        s_ui.filename,
+        model->filename != NULL &&
+        model->filename[0] != '\0'
+            ? model->filename
+            : "No active file"
+    );
+
+    uint8_t progress =
+        model->progress_percent > 100
+            ? 100
+            : model->progress_percent;
+
+    lv_bar_set_value(
+        s_ui.progress,
+        progress,
+        LV_ANIM_OFF
+    );
+
+    lv_label_set_text_fmt(
+        s_ui.progress_text,
+        "%u%%",
+        progress
+    );
 
     char elapsed[20];
     char remaining[20];
     char time_line[64];
-    format_duration(elapsed, sizeof(elapsed), model->elapsed_seconds);
-    format_duration(remaining, sizeof(remaining), model->remaining_seconds);
-    snprintf(time_line, sizeof(time_line), "Elapsed %s  •  Remaining %s", elapsed, remaining);
-    lv_label_set_text(s_ui.time_text, time_line);
-    char temperature[32];
-    if (model->connection == DT_UI_CONNECTION_ONLINE) {
-        format_temperature(temperature, sizeof(temperature),
-                           model->nozzle_c, model->nozzle_target_c);
-        lv_label_set_text(s_ui.nozzle_text, temperature);
-        format_temperature(temperature, sizeof(temperature), model->bed_c, model->bed_target_c);
-        lv_label_set_text(s_ui.bed_text, temperature);
-        lv_label_set_text_fmt(s_ui.fan_text, "%u%%", model->fan_percent);
+
+    format_duration(
+        elapsed,
+        sizeof(elapsed),
+        model->elapsed_seconds
+    );
+
+    format_duration(
+        remaining,
+        sizeof(remaining),
+        model->remaining_seconds
+    );
+
+    snprintf(
+        time_line,
+        sizeof(time_line),
+        "Elapsed %s  •  Remaining %s",
+        elapsed,
+        remaining
+    );
+
+    lv_label_set_text(
+        s_ui.time_text,
+        time_line
+    );
+
+    char temperature[48];
+
+    if (
+        model->connection ==
+        DT_UI_CONNECTION_ONLINE
+    ) {
+        if (
+            isfinite(model->nozzle_c) &&
+            isfinite(model->nozzle_target_c)
+        ) {
+            format_temperature(
+                temperature,
+                sizeof(temperature),
+                model->nozzle_c,
+                model->nozzle_target_c
+            );
+
+            lv_label_set_text(
+                s_ui.nozzle_text,
+                temperature
+            );
+
+            if (
+                s_ui.nozzle_control_text != NULL
+            ) {
+                lv_label_set_text(
+                    s_ui.nozzle_control_text,
+                    temperature
+                );
+            }
+
+        } else {
+            lv_label_set_text(
+                s_ui.nozzle_text,
+                "Unavailable"
+            );
+        }
+
+        if (
+            isfinite(model->bed_c) &&
+            isfinite(model->bed_target_c)
+        ) {
+            format_temperature(
+                temperature,
+                sizeof(temperature),
+                model->bed_c,
+                model->bed_target_c
+            );
+
+            lv_label_set_text(
+                s_ui.bed_text,
+                temperature
+            );
+
+            if (
+                s_ui.bed_control_text != NULL
+            ) {
+                lv_label_set_text(
+                    s_ui.bed_control_text,
+                    temperature
+                );
+            }
+
+        } else {
+            lv_label_set_text(
+                s_ui.bed_text,
+                "Unavailable"
+            );
+        }
+
+        if (model->fan_percent <= 100) {
+            lv_label_set_text_fmt(
+                s_ui.fan_text,
+                "%u%%",
+                model->fan_percent
+            );
+
+            if (
+                s_ui.fan_control_text != NULL
+            ) {
+                lv_label_set_text_fmt(
+                    s_ui.fan_control_text,
+                    "%u%%",
+                    model->fan_percent
+                );
+            }
+
+        } else {
+            lv_label_set_text(
+                s_ui.fan_text,
+                "Unavailable"
+            );
+        }
+
     } else {
-        lv_label_set_text(s_ui.nozzle_text, "Unavailable");
-        lv_label_set_text(s_ui.bed_text, "Unavailable");
-        lv_label_set_text(s_ui.fan_text, "Unavailable");
+        lv_label_set_text(
+            s_ui.nozzle_text,
+            "Unavailable"
+        );
+
+        lv_label_set_text(
+            s_ui.bed_text,
+            "Unavailable"
+        );
+
+        lv_label_set_text(
+            s_ui.fan_text,
+            "Unavailable"
+        );
     }
 
-    const bool paused = model->job_state == DT_UI_JOB_PAUSED;
-    lv_label_set_text(s_ui.pause_label, paused ? "Resume" : "Pause");
-    set_button_enabled(s_ui.pause_button, paused ? model->can_resume : model->can_pause);
-    set_button_enabled(s_ui.cancel_button, model->can_cancel);
+    if (s_ui.axes_text != NULL) {
+        lv_label_set_text_fmt(
+            s_ui.axes_text,
+            "X %.1f   Y %.1f   Z %.1f mm   Home %c%c%c",
+            model->x,
+            model->y,
+            model->z,
+            model->homed_x ? 'X' : '-',
+            model->homed_y ? 'Y' : '-',
+            model->homed_z ? 'Z' : '-'
+        );
+    }
+
+    const bool paused =
+        model->job_state ==
+        DT_UI_JOB_PAUSED;
+
+    lv_label_set_text(
+        s_ui.pause_label,
+        paused
+            ? "Resume"
+            : "Pause"
+    );
+
+    set_button_enabled(
+        s_ui.pause_button,
+        paused
+            ? model->can_resume
+            : model->can_pause
+    );
+
+    set_button_enabled(
+        s_ui.cancel_button,
+        model->can_cancel
+    );
+
+    if (s_ui.home_button != NULL) {
+        set_button_enabled(
+            s_ui.home_button,
+            model->can_home
+        );
+    }
+
+    for (size_t i = 0; i < 6; ++i) {
+        if (s_ui.jog_buttons[i] != NULL) {
+            set_button_enabled(
+                s_ui.jog_buttons[i],
+                model->can_jog
+            );
+        }
+    }
+
+    if (s_ui.heat_button != NULL) {
+        set_button_enabled(
+            s_ui.heat_button,
+            model->can_heat
+        );
+    }
+
+    for (size_t i = 0; i < 3; ++i) {
+        if (s_ui.bed_buttons[i] != NULL) {
+            set_button_enabled(
+                s_ui.bed_buttons[i],
+                model->can_heat
+            );
+        }
+
+        if (s_ui.fan_buttons[i] != NULL) {
+            set_button_enabled(
+                s_ui.fan_buttons[i],
+                model->can_fan
+            );
+        }
+    }
+
+    if (s_ui.extrude_button != NULL) {
+        set_button_enabled(
+            s_ui.extrude_button,
+            model->can_extrude
+        );
+    }
+
+    if (s_ui.retract_button != NULL) {
+        set_button_enabled(
+            s_ui.retract_button,
+            model->can_extrude
+        );
+    }
+
+    return ESP_OK;
+}
+
+
+esp_err_t dt_ui_set_action_handler(
+    dt_ui_action_handler_t handler,
+    void *ctx
+)
+{
+    s_action_handler = handler;
+    s_action_ctx = ctx;
     return ESP_OK;
 }

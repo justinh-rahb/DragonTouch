@@ -2,6 +2,7 @@
 
 #include "sdkconfig.h"
 #include "esp_err.h"
+#include "lvgl.h"
 
 #if defined(CONFIG_DT_BOARD_WAVESHARE_ESP32_S3_TOUCH_LCD_7)
 
@@ -16,9 +17,13 @@
 #endif
 
 /*
- * Hardware bring-up API.
- *
- * This remains deliberately small while the board implementations are
- * established and validated on hardware.
+ * Initialize board hardware, LVGL display, and input device.
+ * Backlight remains OFF until dt_board_lvgl_start().
  */
-esp_err_t dt_board_display_test_init(void);
+esp_err_t dt_board_lvgl_init(lv_display_t **display);
+
+/*
+ * Perform the first complete LVGL render, enable the backlight,
+ * and start the LVGL service task.
+ */
+esp_err_t dt_board_lvgl_start(void);
