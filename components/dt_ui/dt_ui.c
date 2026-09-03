@@ -95,6 +95,17 @@ typedef struct {
     lv_obj_t *filament_extrude_button;
     lv_obj_t *filament_retract_button;
     lv_obj_t *filament_heat_button;
+    lv_obj_t *filament_generic_macro_row;
+    lv_obj_t *afc_summary_text;
+    lv_obj_t *afc_message_text;
+    lv_obj_t *afc_previous_button;
+    lv_obj_t *afc_next_button;
+    lv_obj_t *afc_lane_rows[DT_UI_AFC_LANE_PAGE_SIZE];
+    lv_obj_t *afc_lane_title[DT_UI_AFC_LANE_PAGE_SIZE];
+    lv_obj_t *afc_lane_detail[DT_UI_AFC_LANE_PAGE_SIZE];
+    lv_obj_t *afc_lane_load_button[DT_UI_AFC_LANE_PAGE_SIZE];
+    lv_obj_t *afc_lane_eject_button[DT_UI_AFC_LANE_PAGE_SIZE];
+    size_t afc_lane_offset;
 
 
     lv_obj_t *file_path_text;
@@ -151,6 +162,11 @@ static dt_ui_action_handler_t s_action_handler;
 static void *s_action_ctx;
 static dt_ui_file_request_handler_t s_file_request_handler;
 static void *s_file_request_ctx;
+static dt_ui_filament_request_handler_t s_filament_request_handler;
+static void *s_filament_request_ctx;
+static bool s_pending_filament_request_valid;
+static dt_ui_filament_request_t s_pending_filament_request;
+static int s_pending_filament_lane;
 static dt_ui_action_t s_pending_action;
 
 static lv_color_t color(uint32_t hex)
@@ -533,6 +549,22 @@ static void dispatch_action(dt_ui_action_t action)
 }
 
 
+
+static void dispatch_filament_request(
+    dt_ui_filament_request_t request,
+    int lane_number
+)
+{
+    if (s_filament_request_handler != NULL) {
+        s_filament_request_handler(
+            request,
+            lane_number,
+            s_filament_request_ctx
+        );
+    }
+}
+
+
 static void direct_action_event(lv_event_t *event)
 {
     dispatch_action(
@@ -588,7 +620,16 @@ static void confirm_dialog_event(lv_event_t *event)
 {
     (void)event;
 
-    dispatch_action(s_pending_action);
+    if (s_pending_filament_request_valid) {
+        dispatch_filament_request(
+            s_pending_filament_request,
+            s_pending_filament_lane
+        );
+
+        s_pending_filament_request_valid = false;
+    } else {
+        dispatch_action(s_pending_action);
+    }
 
     lv_obj_add_flag(
         s_ui.dialog_scrim,
@@ -601,6 +642,8 @@ static void show_confirmation(
     const dt_confirmation_t *confirmation
 )
 {
+    s_pending_filament_request_valid = false;
+
     s_pending_action =
         confirmation->action;
 
@@ -1764,6 +1807,9 @@ static void create_control_page(lv_obj_t *page)
 }
 
 
+/*
+ * DT_STAGE5_AFC_LANES
+ */
 static void render_filament_model(void)
 {
     if (s_ui.filament_mode_text == NULL) {
@@ -1793,49 +1839,13 @@ static void render_filament_model(void)
         );
     }
 
-    char capability[192] = {0};
+    char nozzle_text[96] = {0};
 
-    if (!model->capabilities_known) {
-        snprintf(
-            capability,
-            sizeof(capability),
-            "Moonraker object discovery pending."
-        );
-    } else {
-        snprintf(
-            capability,
-            sizeof(capability),
-            "LOAD_FILAMENT: %s\n"
-            "UNLOAD_FILAMENT: %s\n"
-            "M600: %s\n"
-            "AFC: %s  |  MMU: %s  |  Toolchanger: %s",
-            model->has_load_macro ? "yes" : "no",
-            model->has_unload_macro ? "yes" : "no",
-            model->has_m600 ? "yes" : "no",
-            model->afc_detected ? "yes" : "no",
-            model->mmu_detected ? "yes" : "no",
-            model->toolchanger_detected ? "yes" : "no"
-        );
-    }
-
-    lv_label_set_text(
-        s_ui.filament_capability_text,
-        capability
-    );
-
-    /*
-     * DT_STAGE5_NO_LVGL_FLOAT_FMT
-     *
-     * Do not feed floating-point varargs to LVGL's builtin formatter on
-     * this target. Format with libc first, then give LVGL a complete string.
-     */
     if (
         model->online &&
         isfinite(model->nozzle_c) &&
         isfinite(model->nozzle_target_c)
     ) {
-        char nozzle_text[96] = {0};
-
         snprintf(
             nozzle_text,
             sizeof(nozzle_text),
@@ -1846,28 +1856,214 @@ static void render_filament_model(void)
                 ? "  |  extrusion ready"
                 : ""
         );
-
-        lv_label_set_text(
-            s_ui.filament_nozzle_text,
-            nozzle_text
-        );
     } else {
-        lv_label_set_text(
-            s_ui.filament_nozzle_text,
+        snprintf(
+            nozzle_text,
+            sizeof(nozzle_text),
             "Temperature unavailable"
         );
     }
 
+    lv_label_set_text(
+        s_ui.filament_nozzle_text,
+        nozzle_text
+    );
+
+    const bool afc_mode =
+        model->afc_detected &&
+        model->afc_lane_count > 0;
+
+    if (s_ui.filament_generic_macro_row != NULL) {
+        if (afc_mode) {
+            lv_obj_add_flag(
+                s_ui.filament_generic_macro_row,
+                LV_OBJ_FLAG_HIDDEN
+            );
+        } else {
+            lv_obj_remove_flag(
+                s_ui.filament_generic_macro_row,
+                LV_OBJ_FLAG_HIDDEN
+            );
+        }
+    }
+
+    if (s_ui.afc_summary_text != NULL) {
+        if (!afc_mode) {
+            lv_label_set_text(
+                s_ui.afc_summary_text,
+                "No AFC lanes detected."
+            );
+        } else {
+            lv_label_set_text_fmt(
+                s_ui.afc_summary_text,
+                "AFC: %s  |  Loaded: %s  |  %u lane%s",
+                model->afc_state[0] != '\0'
+                    ? model->afc_state
+                    : "--",
+                model->afc_current_load[0] != '\0'
+                    ? model->afc_current_load
+                    : "none",
+                (unsigned)model->afc_lane_count,
+                model->afc_lane_count == 1 ? "" : "s"
+            );
+        }
+    }
+
+    if (s_ui.afc_message_text != NULL) {
+        if (model->afc_message[0] != '\0') {
+            lv_label_set_text(
+                s_ui.afc_message_text,
+                model->afc_message
+            );
+        } else {
+            lv_label_set_text(
+                s_ui.afc_message_text,
+                model->afc_error
+                    ? "AFC reports an error."
+                    : "AFC ready."
+            );
+        }
+    }
+
+    if (
+        s_ui.afc_lane_offset >= model->afc_lane_count &&
+        model->afc_lane_count > 0
+    ) {
+        s_ui.afc_lane_offset =
+            ((model->afc_lane_count - 1U) /
+                DT_UI_AFC_LANE_PAGE_SIZE) *
+            DT_UI_AFC_LANE_PAGE_SIZE;
+    }
+
+    for (
+        size_t slot = 0;
+        slot < DT_UI_AFC_LANE_PAGE_SIZE;
+        ++slot
+    ) {
+        lv_obj_t *row =
+            s_ui.afc_lane_rows[slot];
+
+        if (row == NULL) {
+            continue;
+        }
+
+        const size_t index =
+            s_ui.afc_lane_offset + slot;
+
+        if (
+            !afc_mode ||
+            index >= model->afc_lane_count
+        ) {
+            lv_obj_add_flag(
+                row,
+                LV_OBJ_FLAG_HIDDEN
+            );
+            continue;
+        }
+
+        lv_obj_remove_flag(
+            row,
+            LV_OBJ_FLAG_HIDDEN
+        );
+
+        const dt_ui_afc_lane_t *lane =
+            &model->afc_lanes[index];
+
+        lv_label_set_text_fmt(
+            s_ui.afc_lane_title[slot],
+            "%s  %s",
+            lane->name,
+            lane->map[0] != '\0'
+                ? lane->map
+                : ""
+        );
+
+        char detail[192] = {0};
+
+        snprintf(
+            detail,
+            sizeof(detail),
+            "%s%s%s  |  %s  |  %.1f g\n"
+            "%s  |  prep:%s load:%s hub:%s tool:%s",
+            lane->material[0] != '\0'
+                ? lane->material
+                : "Unknown",
+            lane->color[0] != '\0'
+                ? " "
+                : "",
+            lane->color[0] != '\0'
+                ? lane->color
+                : "",
+            lane->filament_status[0] != '\0'
+                ? lane->filament_status
+                : lane->status,
+            (double)lane->weight_g,
+            lane->status[0] != '\0'
+                ? lane->status
+                : "--",
+            lane->prep ? "Y" : "N",
+            lane->load ? "Y" : "N",
+            lane->loaded_to_hub ? "Y" : "N",
+            lane->tool_loaded ? "Y" : "N"
+        );
+
+        lv_label_set_text(
+            s_ui.afc_lane_detail[slot],
+            detail
+        );
+
+        const bool can_change =
+            model->afc_actions_enabled &&
+            model->has_bt_change_tool &&
+            lane->prep;
+
+        const bool can_eject =
+            model->afc_actions_enabled &&
+            model->has_bt_lane_eject &&
+            (
+                lane->prep ||
+                lane->load ||
+                lane->loaded_to_hub ||
+                lane->tool_loaded
+            );
+
+        set_button_enabled(
+            s_ui.afc_lane_load_button[slot],
+            can_change
+        );
+
+        set_button_enabled(
+            s_ui.afc_lane_eject_button[slot],
+            can_eject
+        );
+    }
+
+    set_button_enabled(
+        s_ui.afc_previous_button,
+        afc_mode &&
+            s_ui.afc_lane_offset > 0
+    );
+
+    set_button_enabled(
+        s_ui.afc_next_button,
+        afc_mode &&
+            s_ui.afc_lane_offset +
+                DT_UI_AFC_LANE_PAGE_SIZE <
+            model->afc_lane_count
+    );
+
     set_button_enabled(
         s_ui.filament_load_button,
-        model->online &&
+        !afc_mode &&
+            model->online &&
             model->capabilities_known &&
             model->has_load_macro
     );
 
     set_button_enabled(
         s_ui.filament_unload_button,
-        model->online &&
+        !afc_mode &&
+            model->online &&
             model->capabilities_known &&
             model->has_unload_macro
     );
@@ -1901,6 +2097,171 @@ static void render_filament_model(void)
  *
  * This page uses one resident card with two action rows.
  */
+
+static void show_afc_confirmation(
+    dt_ui_filament_request_t request,
+    int lane_number,
+    const char *title,
+    const char *body,
+    const char *confirm_label
+)
+{
+    s_pending_filament_request_valid = true;
+    s_pending_filament_request = request;
+    s_pending_filament_lane = lane_number;
+
+    lv_label_set_text(
+        s_ui.dialog_title,
+        title
+    );
+
+    lv_label_set_text(
+        s_ui.dialog_body,
+        body
+    );
+
+    lv_label_set_text(
+        s_ui.dialog_confirm_label,
+        confirm_label
+    );
+
+    set_button_enabled(
+        s_ui.dialog_confirm,
+        s_filament_request_handler != NULL
+    );
+
+    lv_obj_remove_flag(
+        s_ui.dialog_scrim,
+        LV_OBJ_FLAG_HIDDEN
+    );
+
+    lv_obj_move_foreground(
+        s_ui.dialog_scrim
+    );
+}
+
+
+static int afc_lane_for_slot(size_t slot)
+{
+    const size_t index =
+        s_ui.afc_lane_offset + slot;
+
+    if (
+        index >= s_ui.filament_model.afc_lane_count
+    ) {
+        return 0;
+    }
+
+    return
+        s_ui.filament_model
+            .afc_lanes[index]
+            .lane_number;
+}
+
+
+static void afc_lane_load_event(lv_event_t *event)
+{
+    const size_t slot =
+        (size_t)(uintptr_t)
+        lv_event_get_user_data(event);
+
+    const int lane =
+        afc_lane_for_slot(slot);
+
+    if (lane <= 0) {
+        return;
+    }
+
+    char body[192] = {0};
+
+    snprintf(
+        body,
+        sizeof(body),
+        "Run BT_CHANGE_TOOL LANE=%d?\n"
+        "AFC will unload the current lane if necessary "
+        "and load the selected lane.",
+        lane
+    );
+
+    show_afc_confirmation(
+        DT_UI_FILAMENT_REQUEST_CHANGE_TOOL,
+        lane,
+        "Load AFC lane?",
+        body,
+        "Change tool"
+    );
+}
+
+
+static void afc_lane_eject_event(lv_event_t *event)
+{
+    const size_t slot =
+        (size_t)(uintptr_t)
+        lv_event_get_user_data(event);
+
+    const int lane =
+        afc_lane_for_slot(slot);
+
+    if (lane <= 0) {
+        return;
+    }
+
+    char body[192] = {0};
+
+    snprintf(
+        body,
+        sizeof(body),
+        "Run BT_LANE_EJECT LANE=%d?\n"
+        "AFC will fully eject this lane so the spool "
+        "can be removed.",
+        lane
+    );
+
+    show_afc_confirmation(
+        DT_UI_FILAMENT_REQUEST_EJECT_LANE,
+        lane,
+        "Eject AFC lane?",
+        body,
+        "Eject lane"
+    );
+}
+
+
+static void afc_previous_event(lv_event_t *event)
+{
+    (void)event;
+
+    if (
+        s_ui.afc_lane_offset >=
+            DT_UI_AFC_LANE_PAGE_SIZE
+    ) {
+        s_ui.afc_lane_offset -=
+            DT_UI_AFC_LANE_PAGE_SIZE;
+    } else {
+        s_ui.afc_lane_offset = 0;
+    }
+
+    render_filament_model();
+}
+
+
+static void afc_next_event(lv_event_t *event)
+{
+    (void)event;
+
+    if (
+        s_ui.afc_lane_offset +
+            DT_UI_AFC_LANE_PAGE_SIZE <
+        s_ui.filament_model.afc_lane_count
+    ) {
+        s_ui.afc_lane_offset +=
+            DT_UI_AFC_LANE_PAGE_SIZE;
+    }
+
+    render_filament_model();
+}
+
+
 static void create_filament_page(lv_obj_t *page)
 {
     ESP_LOGI(TAG, "FILAMENT_BUILD begin");
@@ -1909,15 +2270,13 @@ static void create_filament_page(lv_obj_t *page)
         create_page_heading(
             page,
             "Filament",
-            "Capability-aware controls for the connected printer."
+            "AFC lanes, printer macros, and manual extruder controls."
         );
-
-    ESP_LOGI(TAG, "FILAMENT_BUILD heading");
 
     lv_obj_t *status =
         make_label(
             heading_row,
-            "Detecting...",
+            "Capability-aware",
             DT_COLOR_MUTED
         );
 
@@ -1929,8 +2288,6 @@ static void create_filament_page(lv_obj_t *page)
         0
     );
 
-    ESP_LOGI(TAG, "FILAMENT_BUILD status");
-
     lv_obj_t *card =
         make_card(
             page,
@@ -1940,8 +2297,6 @@ static void create_filament_page(lv_obj_t *page)
     lv_obj_set_width(card, LV_PCT(100));
     lv_obj_set_flex_grow(card, 1);
 
-    ESP_LOGI(TAG, "FILAMENT_BUILD card");
-
     s_ui.filament_mode_text =
         make_label(
             card,
@@ -1949,30 +2304,192 @@ static void create_filament_page(lv_obj_t *page)
             DT_COLOR_TEXT
         );
 
-    lv_label_set_long_mode(
-        s_ui.filament_mode_text,
-        LV_LABEL_LONG_MODE_WRAP
-    );
+    s_ui.afc_summary_text =
+        make_label(
+            card,
+            "No AFC lanes detected.",
+            DT_COLOR_MUTED
+        );
 
     lv_obj_set_width(
-        s_ui.filament_mode_text,
+        s_ui.afc_summary_text,
         LV_PCT(100)
     );
 
-    s_ui.filament_capability_text =
+    lv_obj_t *afc_nav =
+        lv_obj_create(card);
+
+    lv_obj_remove_style_all(afc_nav);
+    lv_obj_set_size(afc_nav, LV_PCT(100), 34);
+    lv_obj_set_layout(afc_nav, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(afc_nav, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(afc_nav, 8, 0);
+
+    s_ui.afc_previous_button =
+        make_action(afc_nav, "<", false);
+
+    s_ui.afc_next_button =
+        make_action(afc_nav, ">", false);
+
+    lv_obj_add_event_cb(
+        s_ui.afc_previous_button,
+        afc_previous_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    lv_obj_add_event_cb(
+        s_ui.afc_next_button,
+        afc_next_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    for (
+        size_t slot = 0;
+        slot < DT_UI_AFC_LANE_PAGE_SIZE;
+        ++slot
+    ) {
+        lv_obj_t *lane_row =
+            lv_obj_create(card);
+
+        style_surface(lane_row);
+        lv_obj_set_width(lane_row, LV_PCT(100));
+        lv_obj_set_height(lane_row, 82);
+        lv_obj_set_layout(lane_row, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(
+            lane_row,
+            LV_FLEX_FLOW_ROW
+        );
+        lv_obj_set_style_pad_column(
+            lane_row,
+            8,
+            0
+        );
+
+        s_ui.afc_lane_rows[slot] =
+            lane_row;
+
+        lv_obj_t *text_col =
+            lv_obj_create(lane_row);
+
+        lv_obj_remove_style_all(text_col);
+        lv_obj_set_height(text_col, LV_PCT(100));
+        lv_obj_set_flex_grow(text_col, 1);
+        lv_obj_set_layout(text_col, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(
+            text_col,
+            LV_FLEX_FLOW_COLUMN
+        );
+        lv_obj_set_style_pad_row(
+            text_col,
+            3,
+            0
+        );
+
+        s_ui.afc_lane_title[slot] =
+            make_label(
+                text_col,
+                "lane",
+                DT_COLOR_TEXT
+            );
+
+        s_ui.afc_lane_detail[slot] =
+            make_label(
+                text_col,
+                "--",
+                DT_COLOR_MUTED
+            );
+
+        lv_label_set_long_mode(
+            s_ui.afc_lane_detail[slot],
+            LV_LABEL_LONG_MODE_WRAP
+        );
+
+        lv_obj_set_width(
+            s_ui.afc_lane_detail[slot],
+            LV_PCT(100)
+        );
+
+        lv_obj_t *action_col =
+            lv_obj_create(lane_row);
+
+        lv_obj_remove_style_all(action_col);
+        lv_obj_set_size(action_col, 150, LV_PCT(100));
+        lv_obj_set_layout(action_col, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(
+            action_col,
+            LV_FLEX_FLOW_COLUMN
+        );
+        lv_obj_set_style_pad_row(
+            action_col,
+            5,
+            0
+        );
+
+        s_ui.afc_lane_load_button[slot] =
+            make_action(
+                action_col,
+                "Load",
+                true
+            );
+
+        s_ui.afc_lane_eject_button[slot] =
+            make_action(
+                action_col,
+                "Eject",
+                false
+            );
+
+        lv_obj_set_width(
+            s_ui.afc_lane_load_button[slot],
+            LV_PCT(100)
+        );
+
+        lv_obj_set_width(
+            s_ui.afc_lane_eject_button[slot],
+            LV_PCT(100)
+        );
+
+        lv_obj_set_height(
+            s_ui.afc_lane_load_button[slot],
+            32
+        );
+
+        lv_obj_set_height(
+            s_ui.afc_lane_eject_button[slot],
+            32
+        );
+
+        lv_obj_add_event_cb(
+            s_ui.afc_lane_load_button[slot],
+            afc_lane_load_event,
+            LV_EVENT_CLICKED,
+            (void *)(uintptr_t)slot
+        );
+
+        lv_obj_add_event_cb(
+            s_ui.afc_lane_eject_button[slot],
+            afc_lane_eject_event,
+            LV_EVENT_CLICKED,
+            (void *)(uintptr_t)slot
+        );
+    }
+
+    s_ui.afc_message_text =
         make_label(
             card,
-            "Moonraker object discovery pending.",
+            "AFC state unavailable.",
             DT_COLOR_MUTED
         );
 
     lv_label_set_long_mode(
-        s_ui.filament_capability_text,
-        LV_LABEL_LONG_MODE_WRAP
+        s_ui.afc_message_text,
+        LV_LABEL_LONG_MODE_DOTS
     );
 
     lv_obj_set_width(
-        s_ui.filament_capability_text,
+        s_ui.afc_message_text,
         LV_PCT(100)
     );
 
@@ -1983,43 +2500,54 @@ static void create_filament_page(lv_obj_t *page)
             DT_COLOR_TEXT
         );
 
-    lv_obj_set_width(
-        s_ui.filament_nozzle_text,
-        LV_PCT(100)
-    );
-
-    ESP_LOGI(TAG, "FILAMENT_BUILD labels");
-
-    lv_obj_t *macro_row =
+    s_ui.filament_generic_macro_row =
         lv_obj_create(card);
 
-    lv_obj_remove_style_all(macro_row);
-    lv_obj_set_size(macro_row, LV_PCT(100), 42);
-    lv_obj_set_layout(macro_row, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_flow(macro_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_column(macro_row, 8, 0);
+    lv_obj_remove_style_all(
+        s_ui.filament_generic_macro_row
+    );
+
+    lv_obj_set_size(
+        s_ui.filament_generic_macro_row,
+        LV_PCT(100),
+        38
+    );
+
+    lv_obj_set_layout(
+        s_ui.filament_generic_macro_row,
+        LV_LAYOUT_FLEX
+    );
+
+    lv_obj_set_flex_flow(
+        s_ui.filament_generic_macro_row,
+        LV_FLEX_FLOW_ROW
+    );
+
+    lv_obj_set_style_pad_column(
+        s_ui.filament_generic_macro_row,
+        8,
+        0
+    );
 
     s_ui.filament_load_button =
         make_guarded_action(
-            macro_row,
+            s_ui.filament_generic_macro_row,
             "Load",
             &CONFIRM_FILAMENT_LOAD
         );
 
     s_ui.filament_unload_button =
         make_guarded_action(
-            macro_row,
+            s_ui.filament_generic_macro_row,
             "Unload",
             &CONFIRM_FILAMENT_UNLOAD
         );
-
-    ESP_LOGI(TAG, "FILAMENT_BUILD macro-actions");
 
     lv_obj_t *manual_row =
         lv_obj_create(card);
 
     lv_obj_remove_style_all(manual_row);
-    lv_obj_set_size(manual_row, LV_PCT(100), 42);
+    lv_obj_set_size(manual_row, LV_PCT(100), 38);
     lv_obj_set_layout(manual_row, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(manual_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_column(manual_row, 8, 0);
@@ -2044,8 +2572,6 @@ static void create_filament_page(lv_obj_t *page)
             "220 C",
             &CONFIRM_HEAT
         );
-
-    ESP_LOGI(TAG, "FILAMENT_BUILD manual-actions");
 
     render_filament_model();
 
@@ -2370,6 +2896,23 @@ static void recycle_secondary_pages(
             s_ui.filament_extrude_button = NULL;
             s_ui.filament_retract_button = NULL;
             s_ui.filament_heat_button = NULL;
+            s_ui.filament_generic_macro_row = NULL;
+            s_ui.afc_summary_text = NULL;
+            s_ui.afc_message_text = NULL;
+            s_ui.afc_previous_button = NULL;
+            s_ui.afc_next_button = NULL;
+
+            for (
+                size_t slot = 0;
+                slot < DT_UI_AFC_LANE_PAGE_SIZE;
+                ++slot
+            ) {
+                s_ui.afc_lane_rows[slot] = NULL;
+                s_ui.afc_lane_title[slot] = NULL;
+                s_ui.afc_lane_detail[slot] = NULL;
+                s_ui.afc_lane_load_button[slot] = NULL;
+                s_ui.afc_lane_eject_button[slot] = NULL;
+            }
         }
 
         s_ui.page_built[page] =
@@ -3129,6 +3672,18 @@ esp_err_t dt_ui_update_files(
 
     return ESP_OK;
 }
+
+
+esp_err_t dt_ui_set_filament_request_handler(
+    dt_ui_filament_request_handler_t handler,
+    void *ctx
+)
+{
+    s_filament_request_handler = handler;
+    s_filament_request_ctx = ctx;
+    return ESP_OK;
+}
+
 
 esp_err_t dt_ui_set_file_request_handler(
     dt_ui_file_request_handler_t handler,

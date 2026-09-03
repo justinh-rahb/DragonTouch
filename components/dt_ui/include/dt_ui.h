@@ -88,6 +88,32 @@ typedef void (*dt_ui_file_request_handler_t)(
 );
 
 
+#define DT_UI_AFC_MAX_LANES 8
+#define DT_UI_AFC_LANE_PAGE_SIZE 2
+
+typedef enum {
+    DT_UI_FILAMENT_REQUEST_CHANGE_TOOL = 0,
+    DT_UI_FILAMENT_REQUEST_EJECT_LANE,
+} dt_ui_filament_request_t;
+
+typedef struct {
+    char name[24];
+    char map[12];
+    char material[32];
+    char color[16];
+    char status[32];
+    char filament_status[32];
+    char unit[24];
+
+    int lane_number;
+    float weight_g;
+
+    bool prep;
+    bool load;
+    bool loaded_to_hub;
+    bool tool_loaded;
+} dt_ui_afc_lane_t;
+
 typedef struct {
     bool online;
     bool capabilities_known;
@@ -104,10 +130,28 @@ typedef struct {
     bool mmu_detected;
     bool toolchanger_detected;
 
+    bool has_bt_change_tool;
+    bool has_bt_lane_eject;
+
     char load_macro[48];
     char unload_macro[48];
     char mode[64];
+
+    bool afc_error;
+    bool afc_actions_enabled;
+    char afc_state[32];
+    char afc_current_load[24];
+    char afc_message[192];
+
+    size_t afc_lane_count;
+    dt_ui_afc_lane_t afc_lanes[DT_UI_AFC_MAX_LANES];
 } dt_ui_filament_model_t;
+
+typedef void (*dt_ui_filament_request_handler_t)(
+    dt_ui_filament_request_t request,
+    int lane_number,
+    void *ctx
+);
 
 
 typedef enum {
@@ -190,6 +234,11 @@ esp_err_t dt_ui_update_filament(
 
 esp_err_t dt_ui_update_files(
     const dt_ui_files_model_t *model
+);
+
+esp_err_t dt_ui_set_filament_request_handler(
+    dt_ui_filament_request_handler_t handler,
+    void *ctx
 );
 
 esp_err_t dt_ui_set_file_request_handler(

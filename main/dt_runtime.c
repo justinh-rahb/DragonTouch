@@ -32,6 +32,9 @@
 
 static const char *TAG = "dt_runtime";
 
+/* DT_STAGE5_RUN_GCODE_FORWARD_DECL */
+static esp_err_t run_gcode(const char *script);
+
 
 /*
  * RUNTIME_HEAP_DIAG
@@ -82,6 +85,8 @@ static void runtime_heap_diag(const char *where)
 #define DT_ACTION_QUEUE_LEN   12
 #define DT_FILE_QUEUE_LEN     4
 #define DT_CAPABILITY_PERIOD_MS 30000
+#define DT_AFC_STATUS_PERIOD_MS 2000
+#define DT_FILAMENT_QUEUE_LEN 4
 
 
 typedef struct {
@@ -127,8 +132,17 @@ typedef struct {
 } dt_runtime_file_request_t;
 
 
+typedef struct {
+    dt_ui_filament_request_t request;
+    int lane_number;
+} dt_runtime_filament_request_t;
+
+
 static QueueHandle_t s_action_queue;
 static QueueHandle_t s_file_queue;
+static QueueHandle_t s_filament_queue;
+static char s_afc_lane_objects[DT_UI_AFC_MAX_LANES][64];
+static size_t s_afc_lane_object_count;
 static dt_ui_files_model_t *s_files_model;
 static dt_ui_filament_model_t *s_filament_model;
 static char s_selected_file[DT_UI_FILE_PATH_MAX];
@@ -1350,8 +1364,17 @@ static esp_err_t discover_filament_capabilities(void)
     s_filament_model->afc_detected = false;
     s_filament_model->mmu_detected = false;
     s_filament_model->toolchanger_detected = false;
+    s_filament_model->has_bt_change_tool = false;
+    s_filament_model->has_bt_lane_eject = false;
     s_filament_model->load_macro[0] = '\0';
     s_filament_model->unload_macro[0] = '\0';
+
+    s_afc_lane_object_count = 0;
+    memset(
+        s_afc_lane_objects,
+        0,
+        sizeof(s_afc_lane_objects)
+    );
 
     cJSON *item = NULL;
 
@@ -1365,6 +1388,37 @@ static esp_err_t discover_filament_capabilities(void)
 
         const char *object =
             item->valuestring;
+
+        const char *afc_lane_prefix =
+            "AFC_stepper ";
+
+        const size_t afc_lane_prefix_len =
+            strlen(afc_lane_prefix);
+
+        if (
+            strncasecmp(
+                object,
+                afc_lane_prefix,
+                afc_lane_prefix_len
+            ) == 0 &&
+            s_afc_lane_object_count <
+                DT_UI_AFC_MAX_LANES
+        ) {
+            snprintf(
+                s_afc_lane_objects[
+                    s_afc_lane_object_count
+                ],
+                sizeof(
+                    s_afc_lane_objects[
+                        s_afc_lane_object_count
+                    ]
+                ),
+                "%s",
+                object
+            );
+
+            s_afc_lane_object_count++;
+        }
 
         if (
             string_contains_ci(object, "afc") ||
@@ -1442,6 +1496,20 @@ static esp_err_t discover_filament_capabilities(void)
             ) == 0
         ) {
             s_filament_model->has_m600 = true;
+        } else if (
+            strcasecmp(
+                macro,
+                "BT_CHANGE_TOOL"
+            ) == 0
+        ) {
+            s_filament_model->has_bt_change_tool = true;
+        } else if (
+            strcasecmp(
+                macro,
+                "BT_LANE_EJECT"
+            ) == 0
+        ) {
+            s_filament_model->has_bt_lane_eject = true;
         }
     }
 
@@ -1486,19 +1554,449 @@ static esp_err_t discover_filament_capabilities(void)
 
     ESP_LOGI(
         TAG,
-        "filament capabilities load=%d unload=%d m600=%d afc=%d mmu=%d toolchanger=%d",
+        "filament capabilities load=%d unload=%d m600=%d afc=%d mmu=%d toolchanger=%d bt_change=%d bt_eject=%d lanes=%u",
         s_filament_model->has_load_macro,
         s_filament_model->has_unload_macro,
         s_filament_model->has_m600,
         s_filament_model->afc_detected,
         s_filament_model->mmu_detected,
-        s_filament_model->toolchanger_detected
+        s_filament_model->toolchanger_detected,
+        s_filament_model->has_bt_change_tool,
+        s_filament_model->has_bt_lane_eject,
+        (unsigned)s_afc_lane_object_count
     );
 
     push_filament_ui();
 
     return ESP_OK;
 }
+
+
+static void json_copy_string(
+    cJSON *object,
+    const char *name,
+    char *dest,
+    size_t dest_size
+)
+{
+    if (
+        object == NULL ||
+        name == NULL ||
+        dest == NULL ||
+        dest_size == 0
+    ) {
+        return;
+    }
+
+    cJSON *item =
+        cJSON_GetObjectItemCaseSensitive(
+            object,
+            name
+        );
+
+    if (
+        cJSON_IsString(item) &&
+        item->valuestring != NULL
+    ) {
+        snprintf(
+            dest,
+            dest_size,
+            "%s",
+            item->valuestring
+        );
+    } else {
+        dest[0] = '\0';
+    }
+}
+
+
+static bool json_bool_value(
+    cJSON *object,
+    const char *name
+)
+{
+    cJSON *item =
+        cJSON_GetObjectItemCaseSensitive(
+            object,
+            name
+        );
+
+    return cJSON_IsTrue(item);
+}
+
+
+static esp_err_t query_afc_lane_state(
+    dt_ui_job_state_t job_state
+)
+{
+    if (
+        s_filament_model == NULL ||
+        !s_filament_model->afc_detected ||
+        s_afc_lane_object_count == 0
+    ) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    cJSON *request =
+        cJSON_CreateObject();
+
+    cJSON *objects =
+        request != NULL
+            ? cJSON_AddObjectToObject(
+                request,
+                "objects"
+            )
+            : NULL;
+
+    if (objects == NULL) {
+        cJSON_Delete(request);
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddNullToObject(
+        objects,
+        "AFC"
+    );
+
+    for (
+        size_t i = 0;
+        i < s_afc_lane_object_count;
+        ++i
+    ) {
+        cJSON_AddNullToObject(
+            objects,
+            s_afc_lane_objects[i]
+        );
+    }
+
+    char *body =
+        cJSON_PrintUnformatted(request);
+
+    cJSON_Delete(request);
+
+    if (body == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    char *response = NULL;
+
+    esp_err_t err =
+        http_request(
+            HTTP_METHOD_POST,
+            "/printer/objects/query",
+            body,
+            &response,
+            NULL
+        );
+
+    cJSON_free(body);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    cJSON *root =
+        cJSON_Parse(response);
+
+    free(response);
+
+    if (root == NULL) {
+        return ESP_FAIL;
+    }
+
+    cJSON *payload =
+        moonraker_payload(root);
+
+    cJSON *status =
+        cJSON_GetObjectItemCaseSensitive(
+            payload,
+            "status"
+        );
+
+    if (!cJSON_IsObject(status)) {
+        status = payload;
+    }
+
+    cJSON *afc =
+        cJSON_GetObjectItemCaseSensitive(
+            status,
+            "AFC"
+        );
+
+    if (cJSON_IsObject(afc)) {
+        json_copy_string(
+            afc,
+            "current_state",
+            s_filament_model->afc_state,
+            sizeof(s_filament_model->afc_state)
+        );
+
+        json_copy_string(
+            afc,
+            "current_load",
+            s_filament_model->afc_current_load,
+            sizeof(
+                s_filament_model->afc_current_load
+            )
+        );
+
+        s_filament_model->afc_error =
+            json_bool_value(
+                afc,
+                "error_state"
+            );
+
+        s_filament_model->afc_message[0] = '\0';
+
+        cJSON *message =
+            cJSON_GetObjectItemCaseSensitive(
+                afc,
+                "message"
+            );
+
+        if (cJSON_IsObject(message)) {
+            json_copy_string(
+                message,
+                "message",
+                s_filament_model->afc_message,
+                sizeof(
+                    s_filament_model->afc_message
+                )
+            );
+
+            cJSON *message_type =
+                cJSON_GetObjectItemCaseSensitive(
+                    message,
+                    "type"
+                );
+
+            if (
+                cJSON_IsString(message_type) &&
+                message_type->valuestring != NULL &&
+                strcasecmp(
+                    message_type->valuestring,
+                    "error"
+                ) == 0
+            ) {
+                s_filament_model->afc_error = true;
+            }
+        }
+    }
+
+    memset(
+        s_filament_model->afc_lanes,
+        0,
+        sizeof(s_filament_model->afc_lanes)
+    );
+
+    size_t lane_count = 0;
+
+    for (
+        size_t i = 0;
+        i < s_afc_lane_object_count &&
+        lane_count < DT_UI_AFC_MAX_LANES;
+        ++i
+    ) {
+        cJSON *lane_object =
+            cJSON_GetObjectItemCaseSensitive(
+                status,
+                s_afc_lane_objects[i]
+            );
+
+        if (!cJSON_IsObject(lane_object)) {
+            continue;
+        }
+
+        dt_ui_afc_lane_t *lane =
+            &s_filament_model
+                ->afc_lanes[lane_count];
+
+        json_copy_string(
+            lane_object,
+            "name",
+            lane->name,
+            sizeof(lane->name)
+        );
+
+        json_copy_string(
+            lane_object,
+            "map",
+            lane->map,
+            sizeof(lane->map)
+        );
+
+        json_copy_string(
+            lane_object,
+            "material",
+            lane->material,
+            sizeof(lane->material)
+        );
+
+        json_copy_string(
+            lane_object,
+            "color",
+            lane->color,
+            sizeof(lane->color)
+        );
+
+        json_copy_string(
+            lane_object,
+            "status",
+            lane->status,
+            sizeof(lane->status)
+        );
+
+        json_copy_string(
+            lane_object,
+            "filament_status",
+            lane->filament_status,
+            sizeof(lane->filament_status)
+        );
+
+        json_copy_string(
+            lane_object,
+            "unit",
+            lane->unit,
+            sizeof(lane->unit)
+        );
+
+        cJSON *lane_number =
+            cJSON_GetObjectItemCaseSensitive(
+                lane_object,
+                "lane"
+            );
+
+        if (cJSON_IsNumber(lane_number)) {
+            lane->lane_number =
+                (int)lane_number->valuedouble;
+        }
+
+        cJSON *weight =
+            cJSON_GetObjectItemCaseSensitive(
+                lane_object,
+                "weight"
+            );
+
+        if (cJSON_IsNumber(weight)) {
+            lane->weight_g =
+                (float)weight->valuedouble;
+        }
+
+        lane->prep =
+            json_bool_value(
+                lane_object,
+                "prep"
+            );
+
+        lane->load =
+            json_bool_value(
+                lane_object,
+                "load"
+            );
+
+        lane->loaded_to_hub =
+            json_bool_value(
+                lane_object,
+                "loaded_to_hub"
+            );
+
+        lane->tool_loaded =
+            json_bool_value(
+                lane_object,
+                "tool_loaded"
+            );
+
+        lane_count++;
+    }
+
+    s_filament_model->afc_lane_count =
+        lane_count;
+
+    const bool print_active =
+        job_state == DT_UI_JOB_PRINTING ||
+        job_state == DT_UI_JOB_PAUSED;
+
+    const bool afc_idle =
+        s_filament_model->afc_state[0] == '\0' ||
+        strcasecmp(
+            s_filament_model->afc_state,
+            "Idle"
+        ) == 0;
+
+    s_filament_model->afc_actions_enabled =
+        s_filament_model->online &&
+        !print_active &&
+        !s_filament_model->afc_error &&
+        afc_idle;
+
+    cJSON_Delete(root);
+
+    push_filament_ui();
+
+    return ESP_OK;
+}
+
+
+static esp_err_t execute_afc_lane_request(
+    const dt_runtime_filament_request_t *request
+)
+{
+    if (
+        request == NULL ||
+        s_filament_model == NULL ||
+        request->lane_number <= 0
+    ) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!s_filament_model->afc_actions_enabled) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char script[96] = {0};
+
+    switch (request->request) {
+    case DT_UI_FILAMENT_REQUEST_CHANGE_TOOL:
+        if (!s_filament_model->has_bt_change_tool) {
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+
+        snprintf(
+            script,
+            sizeof(script),
+            "BT_CHANGE_TOOL LANE=%d",
+            request->lane_number
+        );
+        break;
+
+    case DT_UI_FILAMENT_REQUEST_EJECT_LANE:
+        if (!s_filament_model->has_bt_lane_eject) {
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+
+        snprintf(
+            script,
+            sizeof(script),
+            "BT_LANE_EJECT LANE=%d",
+            request->lane_number
+        );
+        break;
+
+    default:
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "AFC lane request: %s",
+        script
+    );
+
+    return run_gcode(script);
+}
+
+
+
 
 
 static bool query_status(
@@ -2385,6 +2883,42 @@ static void ui_file_request_handler(
 }
 
 
+
+static void ui_filament_request_handler(
+    dt_ui_filament_request_t request,
+    int lane_number,
+    void *ctx
+)
+{
+    (void)ctx;
+
+    if (s_filament_queue == NULL) {
+        return;
+    }
+
+    dt_runtime_filament_request_t message = {
+        .request = request,
+        .lane_number = lane_number,
+    };
+
+    if (
+        xQueueSend(
+            s_filament_queue,
+            &message,
+            0
+        ) != pdTRUE
+    ) {
+        ESP_LOGW(
+            TAG,
+            "filament request queue full; "
+            "dropping request %d lane %d",
+            (int)request,
+            lane_number
+        );
+    }
+}
+
+
 static void runtime_task(void *arg)
 {
     (void)arg;
@@ -2412,7 +2946,37 @@ static void runtime_task(void *arg)
     TickType_t last_capability_check =
         xTaskGetTickCount();
 
+    TickType_t last_afc_status =
+        xTaskGetTickCount() -
+        pdMS_TO_TICKS(DT_AFC_STATUS_PERIOD_MS);
+
     for (;;) {
+        dt_runtime_filament_request_t filament_request;
+
+        while (
+            s_filament_queue != NULL &&
+            xQueueReceive(
+                s_filament_queue,
+                &filament_request,
+                0
+            ) == pdTRUE
+        ) {
+            esp_err_t filament_err =
+                execute_afc_lane_request(
+                    &filament_request
+                );
+
+            if (filament_err != ESP_OK) {
+                ESP_LOGW(
+                    TAG,
+                    "AFC lane request %d lane %d failed: %s",
+                    (int)filament_request.request,
+                    filament_request.lane_number,
+                    esp_err_to_name(filament_err)
+                );
+            }
+        }
+
         dt_runtime_file_request_t file_request;
 
         while (
@@ -2495,6 +3059,23 @@ static void runtime_task(void *arg)
                 push_filament_ui();
             }
 
+
+            if (
+                online &&
+                s_filament_model != NULL &&
+                s_filament_model->afc_detected &&
+                now - last_afc_status >=
+                    pdMS_TO_TICKS(
+                        DT_AFC_STATUS_PERIOD_MS
+                    )
+            ) {
+                last_afc_status = now;
+
+                (void)query_afc_lane_state(
+                    snap.job
+                );
+            }
+
             if (online) {
                 failure_count = 0;
             } else {
@@ -2552,6 +3133,16 @@ static void runtime_task(void *arg)
                 s_base_url[0] != '\0'
             ) {
                 (void)discover_filament_capabilities();
+
+                if (
+                    s_filament_model->afc_detected
+                ) {
+                    (void)query_afc_lane_state(
+                        s_have_previous
+                            ? s_previous.job
+                            : DT_UI_JOB_IDLE
+                    );
+                }
             }
         }
 
@@ -2705,6 +3296,17 @@ esp_err_t dt_runtime_start(void)
         return ESP_ERR_NO_MEM;
     }
 
+
+    s_filament_queue =
+        xQueueCreate(
+            DT_FILAMENT_QUEUE_LEN,
+            sizeof(dt_runtime_filament_request_t)
+        );
+
+    if (s_filament_queue == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
     s_action_queue =
         xQueueCreate(
             DT_ACTION_QUEUE_LEN,
@@ -2725,6 +3327,14 @@ esp_err_t dt_runtime_start(void)
     ESP_ERROR_CHECK(
         dt_ui_set_file_request_handler(
             ui_file_request_handler,
+            NULL
+        )
+    );
+
+
+    ESP_ERROR_CHECK(
+        dt_ui_set_filament_request_handler(
+            ui_filament_request_handler,
             NULL
         )
     );
