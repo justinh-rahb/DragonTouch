@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <stddef.h>
 #include "esp_err.h"
 #include "lvgl.h"
 
@@ -33,6 +34,60 @@ typedef enum {
     DT_UI_PAGE_SETTINGS,
 } dt_ui_page_t;
 
+#define DT_UI_FILE_ENTRY_MAX 6
+#define DT_UI_FILE_NAME_MAX 72
+#define DT_UI_FILE_PATH_MAX 192
+
+typedef enum {
+    DT_UI_FILE_REQUEST_REFRESH = 0,
+    DT_UI_FILE_REQUEST_UP,
+    DT_UI_FILE_REQUEST_PREVIOUS,
+    DT_UI_FILE_REQUEST_NEXT,
+    DT_UI_FILE_REQUEST_OPEN_DIRECTORY,
+    DT_UI_FILE_REQUEST_SELECT_FILE,
+} dt_ui_file_request_t;
+
+typedef struct {
+    char name[DT_UI_FILE_NAME_MAX];
+    char path[DT_UI_FILE_PATH_MAX];
+    bool is_directory;
+    uint32_t size_bytes;
+} dt_ui_file_entry_t;
+
+typedef struct {
+    bool online;
+    bool loading;
+    char error[96];
+
+    char directory[DT_UI_FILE_PATH_MAX];
+    size_t offset;
+    size_t total_entries;
+    size_t entry_count;
+    bool has_previous;
+    bool has_next;
+
+    dt_ui_file_entry_t entries[DT_UI_FILE_ENTRY_MAX];
+
+    bool selected;
+    char selected_name[DT_UI_FILE_NAME_MAX];
+    char selected_path[DT_UI_FILE_PATH_MAX];
+    uint32_t selected_size_bytes;
+    uint32_t estimated_seconds;
+    float filament_weight_g;
+    float filament_length_mm;
+    float layer_height_mm;
+    char slicer[48];
+    char filament_type[48];
+    char detail_error[96];
+} dt_ui_files_model_t;
+
+typedef void (*dt_ui_file_request_handler_t)(
+    dt_ui_file_request_t request,
+    const char *path,
+    void *ctx
+);
+
+
 typedef enum {
     DT_UI_ACTION_PAUSE = 0,
     DT_UI_ACTION_RESUME,
@@ -59,6 +114,7 @@ typedef enum {
     DT_UI_ACTION_FAN_OFF,
     DT_UI_ACTION_FAN_50,
     DT_UI_ACTION_FAN_100,
+    DT_UI_ACTION_FILE_START_SELECTED,
 } dt_ui_action_t;
 
 typedef void (*dt_ui_action_handler_t)(
@@ -103,6 +159,15 @@ typedef struct {
 esp_err_t dt_ui_create(lv_display_t *display);
 esp_err_t dt_ui_update(const dt_ui_model_t *model);
 esp_err_t dt_ui_show_page(dt_ui_page_t page);
+
+esp_err_t dt_ui_update_files(
+    const dt_ui_files_model_t *model
+);
+
+esp_err_t dt_ui_set_file_request_handler(
+    dt_ui_file_request_handler_t handler,
+    void *ctx
+);
 
 esp_err_t dt_ui_set_action_handler(
     dt_ui_action_handler_t handler,

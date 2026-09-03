@@ -81,6 +81,23 @@ typedef struct {
     lv_obj_t *bed_control_text;
     lv_obj_t *fan_control_text;
 
+    /* DT_STAGE4_FILES */
+    dt_ui_files_model_t files_model;
+
+    lv_obj_t *file_path_text;
+    lv_obj_t *file_status_text;
+    lv_obj_t *file_entry_buttons[DT_UI_FILE_ENTRY_MAX];
+    lv_obj_t *file_entry_labels[DT_UI_FILE_ENTRY_MAX];
+    lv_obj_t *file_up_button;
+    lv_obj_t *file_refresh_button;
+    lv_obj_t *file_previous_button;
+    lv_obj_t *file_next_button;
+    lv_obj_t *file_detail_text;
+    lv_obj_t *file_start_button;
+    char file_confirm_body[320];
+
+    dt_ui_connection_t current_connection;
+
     dt_ui_job_state_t current_job_state;
 
     /*
@@ -119,6 +136,8 @@ static dt_ui_state_t s_ui;
 
 static dt_ui_action_handler_t s_action_handler;
 static void *s_action_ctx;
+static dt_ui_file_request_handler_t s_file_request_handler;
+static void *s_file_request_ctx;
 static dt_ui_action_t s_pending_action;
 
 static lv_color_t color(uint32_t hex)
@@ -976,6 +995,373 @@ static void control_tab_event(lv_event_t *event)
                (size_t)(uintptr_t)lv_event_get_user_data(event));
 }
 
+
+static void render_files_model(void);
+
+static void dispatch_file_request(
+    dt_ui_file_request_t request,
+    const char *path
+)
+{
+    if (s_file_request_handler != NULL) {
+        s_file_request_handler(request, path, s_file_request_ctx);
+    }
+}
+
+static void file_refresh_event(lv_event_t *event)
+{
+    (void)event;
+    dispatch_file_request(DT_UI_FILE_REQUEST_REFRESH, NULL);
+}
+
+static void file_up_event(lv_event_t *event)
+{
+    (void)event;
+    dispatch_file_request(DT_UI_FILE_REQUEST_UP, NULL);
+}
+
+static void file_previous_event(lv_event_t *event)
+{
+    (void)event;
+    dispatch_file_request(DT_UI_FILE_REQUEST_PREVIOUS, NULL);
+}
+
+static void file_next_event(lv_event_t *event)
+{
+    (void)event;
+    dispatch_file_request(DT_UI_FILE_REQUEST_NEXT, NULL);
+}
+
+static void file_entry_event(lv_event_t *event)
+{
+    const size_t index =
+        (size_t)(uintptr_t)lv_event_get_user_data(event);
+
+    if (
+        index >= s_ui.files_model.entry_count ||
+        index >= DT_UI_FILE_ENTRY_MAX
+    ) {
+        return;
+    }
+
+    const dt_ui_file_entry_t *entry =
+        &s_ui.files_model.entries[index];
+
+    if (entry->is_directory) {
+        dispatch_file_request(
+            DT_UI_FILE_REQUEST_OPEN_DIRECTORY,
+            entry->path
+        );
+        return;
+    }
+
+    s_ui.files_model.selected = true;
+
+    snprintf(
+        s_ui.files_model.selected_name,
+        sizeof(s_ui.files_model.selected_name),
+        "%s",
+        entry->name
+    );
+
+    snprintf(
+        s_ui.files_model.selected_path,
+        sizeof(s_ui.files_model.selected_path),
+        "%s",
+        entry->path
+    );
+
+    s_ui.files_model.selected_size_bytes = entry->size_bytes;
+    s_ui.files_model.estimated_seconds = 0;
+    s_ui.files_model.filament_weight_g = 0.0f;
+    s_ui.files_model.filament_length_mm = 0.0f;
+    s_ui.files_model.layer_height_mm = 0.0f;
+    s_ui.files_model.slicer[0] = '\0';
+    s_ui.files_model.filament_type[0] = '\0';
+
+    snprintf(
+        s_ui.files_model.detail_error,
+        sizeof(s_ui.files_model.detail_error),
+        "Loading metadata..."
+    );
+
+    render_files_model();
+
+    select_tab(
+        s_ui.file_tabs,
+        s_ui.file_panels,
+        DT_FILES_TAB_COUNT,
+        1
+    );
+
+    dispatch_file_request(
+        DT_UI_FILE_REQUEST_SELECT_FILE,
+        entry->path
+    );
+}
+
+static void file_start_event(lv_event_t *event)
+{
+    (void)event;
+
+    if (!s_ui.files_model.selected) {
+        return;
+    }
+
+    snprintf(
+        s_ui.file_confirm_body,
+        sizeof(s_ui.file_confirm_body),
+        "Moonraker will start:\n%s\n\n"
+        "The printer must be idle and ready.",
+        s_ui.files_model.selected_name
+    );
+
+    const dt_confirmation_t confirmation = {
+        "Start this print?",
+        s_ui.file_confirm_body,
+        "Start print",
+        false,
+        DT_UI_ACTION_FILE_START_SELECTED,
+    };
+
+    show_confirmation(&confirmation);
+}
+
+static void format_file_size(
+    char *buffer,
+    size_t length,
+    uint32_t bytes
+)
+{
+    if (bytes >= 1024U * 1024U) {
+        snprintf(
+            buffer,
+            length,
+            "%.1f MB",
+            (double)bytes / (1024.0 * 1024.0)
+        );
+    } else if (bytes >= 1024U) {
+        snprintf(
+            buffer,
+            length,
+            "%.0f KB",
+            (double)bytes / 1024.0
+        );
+    } else {
+        snprintf(
+            buffer,
+            length,
+            "%u B",
+            (unsigned)bytes
+        );
+    }
+}
+
+static void render_files_model(void)
+{
+    if (s_ui.file_path_text == NULL) {
+        return;
+    }
+
+    const dt_ui_files_model_t *model =
+        &s_ui.files_model;
+
+    const char *display_path = model->directory;
+
+    if (strncmp(display_path, "gcodes/", 7) == 0) {
+        display_path += 6;
+    } else if (strcmp(display_path, "gcodes") == 0) {
+        display_path = "/";
+    }
+
+    lv_label_set_text_fmt(
+        s_ui.file_path_text,
+        "%s",
+        display_path[0] != '\0' ? display_path : "/"
+    );
+
+    if (model->loading) {
+        lv_label_set_text(s_ui.file_status_text, "Loading...");
+    } else if (model->error[0] != '\0') {
+        lv_label_set_text(s_ui.file_status_text, model->error);
+    } else if (!model->online) {
+        lv_label_set_text(s_ui.file_status_text, "Printer offline");
+    } else {
+        lv_label_set_text_fmt(
+            s_ui.file_status_text,
+            "%u item%s  |  showing %u-%u",
+            (unsigned)model->total_entries,
+            model->total_entries == 1 ? "" : "s",
+            model->total_entries == 0
+                ? 0U
+                : (unsigned)model->offset + 1U,
+            (unsigned)(model->offset + model->entry_count)
+        );
+    }
+
+    for (size_t i = 0; i < DT_UI_FILE_ENTRY_MAX; ++i) {
+        lv_obj_t *button = s_ui.file_entry_buttons[i];
+
+        if (button == NULL) {
+            continue;
+        }
+
+        if (i >= model->entry_count) {
+            lv_obj_add_flag(button, LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+
+        lv_obj_remove_flag(button, LV_OBJ_FLAG_HIDDEN);
+
+        const dt_ui_file_entry_t *entry = &model->entries[i];
+        char size_text[32] = {0};
+
+        format_file_size(
+            size_text,
+            sizeof(size_text),
+            entry->size_bytes
+        );
+
+        if (entry->is_directory) {
+            lv_label_set_text_fmt(
+                s_ui.file_entry_labels[i],
+                "[DIR] %s",
+                entry->name
+            );
+        } else {
+            lv_label_set_text_fmt(
+                s_ui.file_entry_labels[i],
+                "%s   %s",
+                entry->name,
+                size_text
+            );
+        }
+
+        set_button_enabled(
+            button,
+            model->online && !model->loading
+        );
+    }
+
+    set_button_enabled(
+        s_ui.file_refresh_button,
+        !model->loading
+    );
+
+    set_button_enabled(
+        s_ui.file_up_button,
+        !model->loading &&
+            strcmp(model->directory, "gcodes") != 0
+    );
+
+    set_button_enabled(
+        s_ui.file_previous_button,
+        !model->loading && model->has_previous
+    );
+
+    set_button_enabled(
+        s_ui.file_next_button,
+        !model->loading && model->has_next
+    );
+
+    if (s_ui.file_detail_text != NULL) {
+        if (!model->selected) {
+            lv_label_set_text(
+                s_ui.file_detail_text,
+                "Select a G-code file to inspect its Moonraker metadata."
+            );
+        } else if (model->detail_error[0] != '\0') {
+            lv_label_set_text_fmt(
+                s_ui.file_detail_text,
+                "%s\n\n%s",
+                model->selected_name,
+                model->detail_error
+            );
+        } else {
+            char size_text[32] = {0};
+            char time_text[48] = "--";
+            char filament_text[64] = "--";
+            char layer_text[48] = "--";
+
+            format_file_size(
+                size_text,
+                sizeof(size_text),
+                model->selected_size_bytes
+            );
+
+            if (model->estimated_seconds > 0) {
+                snprintf(
+                    time_text,
+                    sizeof(time_text),
+                    "%uh %02um",
+                    (unsigned)(model->estimated_seconds / 3600U),
+                    (unsigned)(
+                        (model->estimated_seconds % 3600U) / 60U
+                    )
+                );
+            }
+
+            if (model->filament_weight_g > 0.0f) {
+                snprintf(
+                    filament_text,
+                    sizeof(filament_text),
+                    "%.1f g%s%s",
+                    (double)model->filament_weight_g,
+                    model->filament_type[0] != '\0' ? "  |  " : "",
+                    model->filament_type
+                );
+            } else if (model->filament_length_mm > 0.0f) {
+                snprintf(
+                    filament_text,
+                    sizeof(filament_text),
+                    "%.1f m%s%s",
+                    (double)(model->filament_length_mm / 1000.0f),
+                    model->filament_type[0] != '\0' ? "  |  " : "",
+                    model->filament_type
+                );
+            }
+
+            if (model->layer_height_mm > 0.0f) {
+                snprintf(
+                    layer_text,
+                    sizeof(layer_text),
+                    "%.2f mm",
+                    (double)model->layer_height_mm
+                );
+            }
+
+            lv_label_set_text_fmt(
+                s_ui.file_detail_text,
+                "%s\n\n"
+                "Size: %s\n"
+                "Estimate: %s\n"
+                "Filament: %s\n"
+                "Layer: %s\n"
+                "Slicer: %s",
+                model->selected_name,
+                size_text,
+                time_text,
+                filament_text,
+                layer_text,
+                model->slicer[0] != '\0' ? model->slicer : "--"
+            );
+        }
+    }
+
+    const bool print_active =
+        s_ui.current_job_state == DT_UI_JOB_PRINTING ||
+        s_ui.current_job_state == DT_UI_JOB_PAUSED;
+
+    set_button_enabled(
+        s_ui.file_start_button,
+        model->online &&
+            model->selected &&
+            !model->loading &&
+            !print_active
+    );
+}
+
+
 static void file_tab_event(lv_event_t *event)
 {
     select_tab(s_ui.file_tabs, s_ui.file_panels, DT_FILES_TAB_COUNT,
@@ -1349,34 +1735,182 @@ static void create_control_page(lv_obj_t *page)
 
 static void create_files_page(lv_obj_t *page)
 {
-    static const char *names[] = {"Recent", "Printer", "USB"};
-    lv_obj_t *tabs = create_page_heading(
-        page, "Print files", "Browse and inspect files before requesting a printer-owned start.");
+    static const char *names[] = {
+        "Browse",
+        "Details",
+        "USB"
+    };
+
+    lv_obj_t *tabs =
+        create_page_heading(
+            page,
+            "Print files",
+            "Browse Moonraker storage, inspect metadata, "
+            "and confirm before starting a print."
+        );
+
     for (size_t i = 0; i < DT_FILES_TAB_COUNT; ++i) {
-        s_ui.file_tabs[i] = create_tab(tabs, names[i], file_tab_event, i);
-        s_ui.file_panels[i] = create_tab_panel(page);
+        s_ui.file_tabs[i] =
+            create_tab(
+                tabs,
+                names[i],
+                file_tab_event,
+                i
+            );
+
+        s_ui.file_panels[i] =
+            create_tab_panel(page);
     }
 
-    lv_obj_t *recent = make_control_card(s_ui.file_panels[0], "RECENT", "dragon_duct_v7.3mf\nToday | 2h 26m | 38 g");
-    lv_obj_t *inspect = make_action(recent, "Inspect file", true);
-    size_card_action(inspect);
-    lv_obj_t *history = make_control_card(s_ui.file_panels[0], "HISTORY", "calibration_cube.3mf\nCompleted yesterday");
-    lv_obj_t *again = make_action(history, "Start unavailable", false);
-    size_card_action(again);
-    set_button_enabled(again, false);
+    lv_obj_t *browser =
+        make_control_card(
+            s_ui.file_panels[0],
+            "PRINTER STORAGE",
+            "/"
+        );
 
-    lv_obj_t *printer = make_control_card(s_ui.file_panels[1], "PRINTER STORAGE", "Folder navigation will use the selected printer's file capability.");
-    lv_obj_t *printer_button = make_action(printer, "Browse unavailable", false);
-    size_card_action(printer_button);
-    set_button_enabled(printer_button, false);
-    make_control_card(s_ui.file_panels[1], "FILE DETAILS", "Select a file to review metadata, preview, and start confirmation.");
+    s_ui.file_path_text = lv_obj_get_child(browser, 1);
 
-    lv_obj_t *usb = make_control_card(s_ui.file_panels[2], "USB STORAGE", "No removable storage detected in the desktop preview.");
-    lv_obj_t *usb_button = make_action(usb, "Rescan unavailable", false);
+    lv_obj_t *nav = lv_obj_create(browser);
+    lv_obj_remove_style_all(nav);
+    lv_obj_set_size(nav, LV_PCT(100), 38);
+    lv_obj_set_layout(nav, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(nav, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(nav, 6, 0);
+
+    s_ui.file_up_button =
+        make_action(nav, "Up", false);
+    s_ui.file_refresh_button =
+        make_action(nav, "Refresh", false);
+    s_ui.file_previous_button =
+        make_action(nav, "<", false);
+    s_ui.file_next_button =
+        make_action(nav, ">", false);
+
+    lv_obj_add_event_cb(
+        s_ui.file_up_button,
+        file_up_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+    lv_obj_add_event_cb(
+        s_ui.file_refresh_button,
+        file_refresh_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+    lv_obj_add_event_cb(
+        s_ui.file_previous_button,
+        file_previous_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+    lv_obj_add_event_cb(
+        s_ui.file_next_button,
+        file_next_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    s_ui.file_status_text =
+        make_label(
+            browser,
+            "Waiting for Moonraker...",
+            DT_COLOR_MUTED
+        );
+
+    lv_obj_set_width(
+        s_ui.file_status_text,
+        LV_PCT(100)
+    );
+
+    for (size_t i = 0; i < DT_UI_FILE_ENTRY_MAX; ++i) {
+        lv_obj_t *button =
+            make_action(browser, "--", false);
+
+        lv_obj_set_width(button, LV_PCT(100));
+        lv_obj_set_height(button, 34);
+        lv_obj_set_flex_grow(button, 0);
+
+        s_ui.file_entry_buttons[i] = button;
+        s_ui.file_entry_labels[i] =
+            lv_obj_get_child(button, 0);
+
+        lv_label_set_long_mode(
+            s_ui.file_entry_labels[i],
+            LV_LABEL_LONG_MODE_DOTS
+        );
+
+        lv_obj_set_width(
+            s_ui.file_entry_labels[i],
+            LV_PCT(92)
+        );
+
+        lv_obj_add_event_cb(
+            button,
+            file_entry_event,
+            LV_EVENT_CLICKED,
+            (void *)(uintptr_t)i
+        );
+    }
+
+    lv_obj_t *details =
+        make_control_card(
+            s_ui.file_panels[1],
+            "FILE DETAILS",
+            "Select a G-code file to inspect its Moonraker metadata."
+        );
+
+    s_ui.file_detail_text = lv_obj_get_child(details, 1);
+
+    lv_label_set_long_mode(
+        s_ui.file_detail_text,
+        LV_LABEL_LONG_MODE_WRAP
+    );
+
+    lv_obj_set_width(
+        s_ui.file_detail_text,
+        LV_PCT(100)
+    );
+
+    s_ui.file_start_button =
+        make_action(details, "Start print", true);
+
+    size_card_action(s_ui.file_start_button);
+
+    lv_obj_add_event_cb(
+        s_ui.file_start_button,
+        file_start_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    set_button_enabled(
+        s_ui.file_start_button,
+        false
+    );
+
+    lv_obj_t *usb =
+        make_control_card(
+            s_ui.file_panels[2],
+            "USB STORAGE",
+            "Removable storage is not configured for this DragonTouch target."
+        );
+
+    lv_obj_t *usb_button =
+        make_action(usb, "Unavailable", false);
+
     size_card_action(usb_button);
     set_button_enabled(usb_button, false);
-    make_control_card(s_ui.file_panels[2], "IMPORT", "Local import remains outside the scaffold until board storage is known.");
-    select_tab(s_ui.file_tabs, s_ui.file_panels, DT_FILES_TAB_COUNT, 0);
+
+    select_tab(
+        s_ui.file_tabs,
+        s_ui.file_panels,
+        DT_FILES_TAB_COUNT,
+        0
+    );
+
+    render_files_model();
 }
 
 
@@ -1485,6 +2019,27 @@ static void recycle_secondary_pages(
         clear_recycled_page_refs(
             page
         );
+
+        if (page == DT_UI_PAGE_FILES) {
+            s_ui.file_path_text = NULL;
+            s_ui.file_status_text = NULL;
+            s_ui.file_up_button = NULL;
+            s_ui.file_refresh_button = NULL;
+            s_ui.file_previous_button = NULL;
+            s_ui.file_next_button = NULL;
+            s_ui.file_detail_text = NULL;
+            s_ui.file_start_button = NULL;
+
+            for (size_t file_i = 0; file_i < DT_UI_FILE_ENTRY_MAX; ++file_i) {
+                s_ui.file_entry_buttons[file_i] = NULL;
+                s_ui.file_entry_labels[file_i] = NULL;
+            }
+
+            for (size_t tab_i = 0; tab_i < DT_FILES_TAB_COUNT; ++tab_i) {
+                s_ui.file_tabs[tab_i] = NULL;
+                s_ui.file_panels[tab_i] = NULL;
+            }
+        }
 
         s_ui.page_built[page] =
             false;
@@ -1673,7 +2228,7 @@ static void create_dialog_overlay(void)
     lv_label_set_long_mode(s_ui.dialog_body, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_width(s_ui.dialog_body, LV_PCT(100));
     lv_obj_set_flex_grow(s_ui.dialog_body, 1);
-    lv_obj_t *guard = make_label(dialog, "PREVIEW ONLY | NO COMMAND HANDLER", DT_COLOR_WARNING);
+    lv_obj_t *guard = make_label(dialog, "PRINTER COMMAND | CONFIRM BEFORE SEND", DT_COLOR_WARNING);
     lv_obj_set_style_text_font(guard, &lv_font_montserrat_12, 0);
 
     lv_obj_t *actions = lv_obj_create(dialog);
@@ -1872,6 +2427,11 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
 
     s_ui.current_job_state =
         model->job_state;
+
+    s_ui.current_connection = model->connection;
+    if (s_ui.file_start_button != NULL) {
+        render_files_model();
+    }
 
     lv_label_set_text(
         s_ui.device_name,
@@ -2202,6 +2762,39 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
         );
     }
 
+    return ESP_OK;
+}
+
+
+
+esp_err_t dt_ui_update_files(
+    const dt_ui_files_model_t *model
+)
+{
+    if (!s_ui.ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (model == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_ui.files_model = *model;
+
+    if (s_ui.page_built[DT_UI_PAGE_FILES]) {
+        render_files_model();
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t dt_ui_set_file_request_handler(
+    dt_ui_file_request_handler_t handler,
+    void *ctx
+)
+{
+    s_file_request_handler = handler;
+    s_file_request_ctx = ctx;
     return ESP_OK;
 }
 

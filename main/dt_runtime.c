@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "cJSON.h"
 
@@ -79,6 +80,7 @@ static void runtime_heap_diag(const char *where)
 #define DT_HTTP_TIMEOUT_MS    3500
 #define DT_HTTP_RESPONSE_MAX  12288
 #define DT_ACTION_QUEUE_LEN   12
+#define DT_FILE_QUEUE_LEN     4
 
 
 typedef struct {
@@ -118,7 +120,16 @@ typedef struct {
 } runtime_snapshot_t;
 
 
+typedef struct {
+    dt_ui_file_request_t request;
+    char path[DT_UI_FILE_PATH_MAX];
+} dt_runtime_file_request_t;
+
+
 static QueueHandle_t s_action_queue;
+static QueueHandle_t s_file_queue;
+static dt_ui_files_model_t *s_files_model;
+static char s_selected_file[DT_UI_FILE_PATH_MAX];
 
 static char s_moonraker_host[128];
 static char s_base_url[160];
@@ -468,6 +479,753 @@ static bool json_number(
 
     return true;
 }
+
+
+static bool file_name_is_gcode(const char *name)
+{
+    if (name == NULL) {
+        return false;
+    }
+
+    const char *dot = strrchr(name, '.');
+
+    if (dot == NULL) {
+        return false;
+    }
+
+    return
+        strcasecmp(dot, ".gcode") == 0 ||
+        strcasecmp(dot, ".gco") == 0 ||
+        strcasecmp(dot, ".g") == 0;
+}
+
+static bool url_encode_query_value(
+    const char *input,
+    char *output,
+    size_t output_size
+)
+{
+    static const char hex[] = "0123456789ABCDEF";
+
+    if (
+        input == NULL ||
+        output == NULL ||
+        output_size == 0
+    ) {
+        return false;
+    }
+
+    size_t out = 0;
+
+    for (
+        const unsigned char *p = (const unsigned char *)input;
+        *p != '\0';
+        ++p
+    ) {
+        const bool unreserved =
+            (*p >= 'a' && *p <= 'z') ||
+            (*p >= 'A' && *p <= 'Z') ||
+            (*p >= '0' && *p <= '9') ||
+            *p == '-' ||
+            *p == '_' ||
+            *p == '.' ||
+            *p == '~';
+
+        if (unreserved) {
+            if (out + 1 >= output_size) {
+                return false;
+            }
+            output[out++] = (char)*p;
+        } else {
+            if (out + 3 >= output_size) {
+                return false;
+            }
+            output[out++] = '%';
+            output[out++] = hex[(*p >> 4) & 0x0f];
+            output[out++] = hex[*p & 0x0f];
+        }
+    }
+
+    output[out] = '\0';
+    return true;
+}
+
+static const char *relative_gcode_path(const char *path)
+{
+    if (path == NULL) {
+        return "";
+    }
+
+    return strncmp(path, "gcodes/", 7) == 0
+        ? path + 7
+        : path;
+}
+
+static void push_files_ui(void)
+{
+    if (s_files_model == NULL) {
+        return;
+    }
+
+    if (!lvgl_port_lock(200)) {
+        ESP_LOGW(
+            TAG,
+            "LVGL lock timeout; skipping file UI update"
+        );
+        return;
+    }
+
+    esp_err_t err = dt_ui_update_files(s_files_model);
+
+    lvgl_port_unlock();
+
+    if (err != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "dt_ui_update_files: %s",
+            esp_err_to_name(err)
+        );
+    }
+}
+
+static void files_set_error(const char *message)
+{
+    if (s_files_model == NULL) {
+        return;
+    }
+
+    s_files_model->loading = false;
+
+    snprintf(
+        s_files_model->error,
+        sizeof(s_files_model->error),
+        "%s",
+        message != NULL ? message : "File request failed"
+    );
+
+    push_files_ui();
+}
+
+static size_t files_count_eligible(cJSON *dirs, cJSON *files)
+{
+    size_t total = 0;
+    cJSON *item = NULL;
+
+    cJSON_ArrayForEach(item, dirs) {
+        cJSON *dirname =
+            cJSON_GetObjectItemCaseSensitive(item, "dirname");
+
+        if (
+            cJSON_IsString(dirname) &&
+            dirname->valuestring != NULL &&
+            dirname->valuestring[0] != '.'
+        ) {
+            total++;
+        }
+    }
+
+    cJSON_ArrayForEach(item, files) {
+        cJSON *filename =
+            cJSON_GetObjectItemCaseSensitive(item, "filename");
+
+        if (
+            cJSON_IsString(filename) &&
+            filename->valuestring != NULL &&
+            file_name_is_gcode(filename->valuestring)
+        ) {
+            total++;
+        }
+    }
+
+    return total;
+}
+
+/*
+ * DT_STAGE4_BOUNDED_PATH_COPY
+ *
+ * Avoid format-truncation and never create a silently truncated
+ * Moonraker path. Overlong entries are skipped instead.
+ */
+static bool files_fill_entry(
+    dt_ui_file_entry_t *entry,
+    const char *name,
+    bool is_directory,
+    uint32_t size
+)
+{
+    if (
+        entry == NULL ||
+        name == NULL ||
+        s_files_model == NULL
+    ) {
+        return false;
+    }
+
+    const size_t directory_len =
+        strlen(s_files_model->directory);
+
+    const size_t name_len =
+        strlen(name);
+
+    if (
+        directory_len + 1U + name_len + 1U >
+        sizeof(entry->path)
+    ) {
+        ESP_LOGW(
+            TAG,
+            "skipping overlong file path: dir=%u name=%u",
+            (unsigned)directory_len,
+            (unsigned)name_len
+        );
+
+        return false;
+    }
+
+    memset(entry, 0, sizeof(*entry));
+
+    const size_t visible_name_len =
+        name_len < sizeof(entry->name) - 1U
+            ? name_len
+            : sizeof(entry->name) - 1U;
+
+    memcpy(
+        entry->name,
+        name,
+        visible_name_len
+    );
+
+    entry->name[visible_name_len] = '\0';
+
+    memcpy(
+        entry->path,
+        s_files_model->directory,
+        directory_len
+    );
+
+    entry->path[directory_len] = '/';
+
+    memcpy(
+        entry->path + directory_len + 1U,
+        name,
+        name_len
+    );
+
+    entry->path[
+        directory_len + 1U + name_len
+    ] = '\0';
+
+    entry->is_directory = is_directory;
+    entry->size_bytes = size;
+
+    return true;
+}
+
+static esp_err_t files_refresh_directory(void)
+{
+    if (s_files_model == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_files_model->online = s_base_url[0] != '\0';
+    s_files_model->loading = true;
+    s_files_model->error[0] = '\0';
+    s_files_model->entry_count = 0;
+
+    memset(
+        s_files_model->entries,
+        0,
+        sizeof(s_files_model->entries)
+    );
+
+    push_files_ui();
+
+    if (!s_files_model->online) {
+        files_set_error("Printer is not configured");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char encoded[640] = {0};
+
+    if (
+        !url_encode_query_value(
+            s_files_model->directory,
+            encoded,
+            sizeof(encoded)
+        )
+    ) {
+        files_set_error("Directory path is too long");
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    char request_path[768] = {0};
+
+    snprintf(
+        request_path,
+        sizeof(request_path),
+        "/server/files/directory?path=%s&extended=false",
+        encoded
+    );
+
+    char *response = NULL;
+
+    esp_err_t err =
+        http_request(
+            HTTP_METHOD_GET,
+            request_path,
+            NULL,
+            &response,
+            NULL
+        );
+
+    if (err != ESP_OK) {
+        files_set_error("Moonraker directory request failed");
+        return err;
+    }
+
+    cJSON *root = cJSON_Parse(response);
+    free(response);
+
+    if (root == NULL) {
+        files_set_error("Invalid directory response");
+        return ESP_FAIL;
+    }
+
+    cJSON *payload = moonraker_payload(root);
+
+    cJSON *dirs =
+        cJSON_GetObjectItemCaseSensitive(payload, "dirs");
+
+    cJSON *files =
+        cJSON_GetObjectItemCaseSensitive(payload, "files");
+
+    if (!cJSON_IsArray(dirs) || !cJSON_IsArray(files)) {
+        cJSON_Delete(root);
+        files_set_error("Moonraker directory data missing");
+        return ESP_FAIL;
+    }
+
+    const size_t total =
+        files_count_eligible(dirs, files);
+
+    s_files_model->total_entries = total;
+
+    if (total == 0) {
+        s_files_model->offset = 0;
+    } else if (s_files_model->offset >= total) {
+        s_files_model->offset =
+            ((total - 1) / DT_UI_FILE_ENTRY_MAX) *
+            DT_UI_FILE_ENTRY_MAX;
+    }
+
+    size_t logical_index = 0;
+    size_t filled = 0;
+    cJSON *item = NULL;
+
+    cJSON_ArrayForEach(item, dirs) {
+        cJSON *dirname =
+            cJSON_GetObjectItemCaseSensitive(item, "dirname");
+
+        if (
+            !cJSON_IsString(dirname) ||
+            dirname->valuestring == NULL ||
+            dirname->valuestring[0] == '.'
+        ) {
+            continue;
+        }
+
+        if (
+            logical_index >= s_files_model->offset &&
+            filled < DT_UI_FILE_ENTRY_MAX
+        ) {
+            cJSON *size =
+                cJSON_GetObjectItemCaseSensitive(item, "size");
+
+            if (
+                files_fill_entry(
+                    &s_files_model->entries[filled],
+                    dirname->valuestring,
+                    true,
+                    cJSON_IsNumber(size)
+                        ? (uint32_t)size->valuedouble
+                        : 0U
+                )
+            ) {
+                filled++;
+            }
+        }
+
+        logical_index++;
+    }
+
+    cJSON_ArrayForEach(item, files) {
+        cJSON *filename =
+            cJSON_GetObjectItemCaseSensitive(item, "filename");
+
+        if (
+            !cJSON_IsString(filename) ||
+            filename->valuestring == NULL ||
+            !file_name_is_gcode(filename->valuestring)
+        ) {
+            continue;
+        }
+
+        if (
+            logical_index >= s_files_model->offset &&
+            filled < DT_UI_FILE_ENTRY_MAX
+        ) {
+            cJSON *size =
+                cJSON_GetObjectItemCaseSensitive(item, "size");
+
+            if (
+                files_fill_entry(
+                    &s_files_model->entries[filled],
+                    filename->valuestring,
+                    false,
+                    cJSON_IsNumber(size)
+                        ? (uint32_t)size->valuedouble
+                        : 0U
+                )
+            ) {
+                filled++;
+            }
+        }
+
+        logical_index++;
+    }
+
+    cJSON_Delete(root);
+
+    s_files_model->entry_count = filled;
+    s_files_model->has_previous =
+        s_files_model->offset > 0;
+    s_files_model->has_next =
+        s_files_model->offset + filled < total;
+    s_files_model->loading = false;
+    s_files_model->error[0] = '\0';
+
+    push_files_ui();
+
+    ESP_LOGI(
+        TAG,
+        "files dir=%s total=%u offset=%u shown=%u",
+        s_files_model->directory,
+        (unsigned)total,
+        (unsigned)s_files_model->offset,
+        (unsigned)filled
+    );
+
+    return ESP_OK;
+}
+
+static esp_err_t files_select(const char *full_path)
+{
+    if (
+        s_files_model == NULL ||
+        full_path == NULL ||
+        full_path[0] == '\0'
+    ) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *relative =
+        relative_gcode_path(full_path);
+
+    snprintf(
+        s_selected_file,
+        sizeof(s_selected_file),
+        "%s",
+        relative
+    );
+
+    const char *name = strrchr(relative, '/');
+    name = name != NULL ? name + 1 : relative;
+
+    s_files_model->selected = true;
+
+    const size_t selected_name_len =
+        strlen(name);
+
+    const size_t selected_visible_len =
+        selected_name_len <
+            sizeof(s_files_model->selected_name) - 1U
+            ? selected_name_len
+            : sizeof(s_files_model->selected_name) - 1U;
+
+    memcpy(
+        s_files_model->selected_name,
+        name,
+        selected_visible_len
+    );
+
+    s_files_model->selected_name[
+        selected_visible_len
+    ] = '\0';
+
+    snprintf(
+        s_files_model->selected_path,
+        sizeof(s_files_model->selected_path),
+        "%s",
+        full_path
+    );
+
+    s_files_model->estimated_seconds = 0;
+    s_files_model->filament_weight_g = 0.0f;
+    s_files_model->filament_length_mm = 0.0f;
+    s_files_model->layer_height_mm = 0.0f;
+    s_files_model->slicer[0] = '\0';
+    s_files_model->filament_type[0] = '\0';
+
+    for (size_t i = 0; i < s_files_model->entry_count; ++i) {
+        if (
+            strcmp(
+                s_files_model->entries[i].path,
+                full_path
+            ) == 0
+        ) {
+            s_files_model->selected_size_bytes =
+                s_files_model->entries[i].size_bytes;
+            break;
+        }
+    }
+
+    snprintf(
+        s_files_model->detail_error,
+        sizeof(s_files_model->detail_error),
+        "Loading metadata..."
+    );
+
+    push_files_ui();
+
+    char encoded[640] = {0};
+
+    if (
+        !url_encode_query_value(
+            relative,
+            encoded,
+            sizeof(encoded)
+        )
+    ) {
+        snprintf(
+            s_files_model->detail_error,
+            sizeof(s_files_model->detail_error),
+            "Filename is too long"
+        );
+        push_files_ui();
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    char request_path[768] = {0};
+
+    snprintf(
+        request_path,
+        sizeof(request_path),
+        "/server/files/metadata?filename=%s",
+        encoded
+    );
+
+    char *response = NULL;
+
+    esp_err_t err =
+        http_request(
+            HTTP_METHOD_GET,
+            request_path,
+            NULL,
+            &response,
+            NULL
+        );
+
+    if (err != ESP_OK) {
+        snprintf(
+            s_files_model->detail_error,
+            sizeof(s_files_model->detail_error),
+            "Metadata unavailable"
+        );
+        push_files_ui();
+        return err;
+    }
+
+    cJSON *root = cJSON_Parse(response);
+    free(response);
+
+    if (root == NULL) {
+        snprintf(
+            s_files_model->detail_error,
+            sizeof(s_files_model->detail_error),
+            "Invalid metadata response"
+        );
+        push_files_ui();
+        return ESP_FAIL;
+    }
+
+    cJSON *payload = moonraker_payload(root);
+
+    cJSON *size =
+        cJSON_GetObjectItemCaseSensitive(payload, "size");
+    if (cJSON_IsNumber(size)) {
+        s_files_model->selected_size_bytes =
+            (uint32_t)size->valuedouble;
+    }
+
+    cJSON *estimated =
+        cJSON_GetObjectItemCaseSensitive(
+            payload,
+            "estimated_time"
+        );
+    if (cJSON_IsNumber(estimated)) {
+        s_files_model->estimated_seconds =
+            estimated->valuedouble > 0.0
+                ? (uint32_t)estimated->valuedouble
+                : 0U;
+    }
+
+    cJSON *weight =
+        cJSON_GetObjectItemCaseSensitive(
+            payload,
+            "filament_weight_total"
+        );
+    if (cJSON_IsNumber(weight)) {
+        s_files_model->filament_weight_g =
+            (float)weight->valuedouble;
+    }
+
+    cJSON *length =
+        cJSON_GetObjectItemCaseSensitive(
+            payload,
+            "filament_total"
+        );
+    if (cJSON_IsNumber(length)) {
+        s_files_model->filament_length_mm =
+            (float)length->valuedouble;
+    }
+
+    cJSON *layer =
+        cJSON_GetObjectItemCaseSensitive(
+            payload,
+            "layer_height"
+        );
+    if (cJSON_IsNumber(layer)) {
+        s_files_model->layer_height_mm =
+            (float)layer->valuedouble;
+    }
+
+    cJSON *slicer =
+        cJSON_GetObjectItemCaseSensitive(payload, "slicer");
+    if (
+        cJSON_IsString(slicer) &&
+        slicer->valuestring != NULL
+    ) {
+        snprintf(
+            s_files_model->slicer,
+            sizeof(s_files_model->slicer),
+            "%s",
+            slicer->valuestring
+        );
+    }
+
+    cJSON *filament_type =
+        cJSON_GetObjectItemCaseSensitive(
+            payload,
+            "filament_type"
+        );
+    if (
+        cJSON_IsString(filament_type) &&
+        filament_type->valuestring != NULL
+    ) {
+        snprintf(
+            s_files_model->filament_type,
+            sizeof(s_files_model->filament_type),
+            "%s",
+            filament_type->valuestring
+        );
+    }
+
+    cJSON_Delete(root);
+
+    s_files_model->detail_error[0] = '\0';
+    push_files_ui();
+
+    return ESP_OK;
+}
+
+static esp_err_t files_handle_request(
+    const dt_runtime_file_request_t *request
+)
+{
+    if (request == NULL || s_files_model == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    switch (request->request) {
+    case DT_UI_FILE_REQUEST_REFRESH:
+        return files_refresh_directory();
+
+    case DT_UI_FILE_REQUEST_UP: {
+        if (strcmp(s_files_model->directory, "gcodes") == 0) {
+            return ESP_OK;
+        }
+
+        char *slash =
+            strrchr(s_files_model->directory, '/');
+
+        if (slash == NULL) {
+            snprintf(
+                s_files_model->directory,
+                sizeof(s_files_model->directory),
+                "gcodes"
+            );
+        } else {
+            *slash = '\0';
+        }
+
+        s_files_model->offset = 0;
+        s_files_model->selected = false;
+        s_selected_file[0] = '\0';
+
+        return files_refresh_directory();
+    }
+
+    case DT_UI_FILE_REQUEST_PREVIOUS:
+        if (s_files_model->offset >= DT_UI_FILE_ENTRY_MAX) {
+            s_files_model->offset -= DT_UI_FILE_ENTRY_MAX;
+        } else {
+            s_files_model->offset = 0;
+        }
+        return files_refresh_directory();
+
+    case DT_UI_FILE_REQUEST_NEXT:
+        if (s_files_model->has_next) {
+            s_files_model->offset += DT_UI_FILE_ENTRY_MAX;
+        }
+        return files_refresh_directory();
+
+    case DT_UI_FILE_REQUEST_OPEN_DIRECTORY:
+        if (request->path[0] == '\0') {
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        snprintf(
+            s_files_model->directory,
+            sizeof(s_files_model->directory),
+            "%s",
+            request->path
+        );
+
+        s_files_model->offset = 0;
+        s_files_model->selected = false;
+        s_selected_file[0] = '\0';
+
+        return files_refresh_directory();
+
+    case DT_UI_FILE_REQUEST_SELECT_FILE:
+        return files_select(request->path);
+
+    default:
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+}
+
+
+
 
 
 static bool query_status(
@@ -1081,6 +1839,48 @@ static esp_err_t run_gcode(
 }
 
 
+
+static esp_err_t start_selected_file(void)
+{
+    if (s_selected_file[0] == '\0') {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (
+        s_have_previous &&
+        (
+            s_previous.job == DT_UI_JOB_PRINTING ||
+            s_previous.job == DT_UI_JOB_PAUSED
+        )
+    ) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char encoded[640] = {0};
+
+    if (
+        !url_encode_query_value(
+            s_selected_file,
+            encoded,
+            sizeof(encoded)
+        )
+    ) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    char path[768] = {0};
+
+    snprintf(
+        path,
+        sizeof(path),
+        "/printer/print/start?filename=%s",
+        encoded
+    );
+
+    return post_endpoint(path);
+}
+
+
 static esp_err_t execute_action(
     dt_ui_action_t action
 )
@@ -1197,6 +1997,9 @@ static esp_err_t execute_action(
             "M106 S255"
         );
 
+    case DT_UI_ACTION_FILE_START_SELECTED:
+        return start_selected_file();
+
     default:
         return ESP_ERR_NOT_SUPPORTED;
     }
@@ -1231,6 +2034,48 @@ static void ui_action_handler(
 }
 
 
+
+static void ui_file_request_handler(
+    dt_ui_file_request_t request,
+    const char *path,
+    void *ctx
+)
+{
+    (void)ctx;
+
+    if (s_file_queue == NULL) {
+        return;
+    }
+
+    dt_runtime_file_request_t message = {
+        .request = request,
+    };
+
+    if (path != NULL) {
+        snprintf(
+            message.path,
+            sizeof(message.path),
+            "%s",
+            path
+        );
+    }
+
+    if (
+        xQueueSend(
+            s_file_queue,
+            &message,
+            0
+        ) != pdTRUE
+    ) {
+        ESP_LOGW(
+            TAG,
+            "file request queue full; dropping request %d",
+            (int)request
+        );
+    }
+}
+
+
 static void runtime_task(void *arg)
 {
     (void)arg;
@@ -1247,7 +2092,37 @@ static void runtime_task(void *arg)
         xTaskGetTickCount() -
         pdMS_TO_TICKS(DT_STATUS_PERIOD_MS);
 
+    if (s_files_model != NULL) {
+        (void)files_refresh_directory();
+    }
+
     for (;;) {
+        dt_runtime_file_request_t file_request;
+
+        while (
+            s_file_queue != NULL &&
+            xQueueReceive(
+                s_file_queue,
+                &file_request,
+                0
+            ) == pdTRUE
+        ) {
+            esp_err_t file_err =
+                files_handle_request(&file_request);
+
+            if (
+                file_err != ESP_OK &&
+                file_err != ESP_ERR_INVALID_STATE
+            ) {
+                ESP_LOGW(
+                    TAG,
+                    "file request %d failed: %s",
+                    (int)file_request.request,
+                    esp_err_to_name(file_err)
+                );
+            }
+        }
+
         dt_ui_action_t action;
 
         while (
@@ -1445,6 +2320,33 @@ esp_err_t dt_runtime_start(void)
 
     runtime_heap_diag("network-phase-complete");
 
+    s_files_model =
+        heap_caps_calloc(
+            1,
+            sizeof(*s_files_model),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        );
+
+    if (s_files_model == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    snprintf(
+        s_files_model->directory,
+        sizeof(s_files_model->directory),
+        "gcodes"
+    );
+
+    s_file_queue =
+        xQueueCreate(
+            DT_FILE_QUEUE_LEN,
+            sizeof(dt_runtime_file_request_t)
+        );
+
+    if (s_file_queue == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
     s_action_queue =
         xQueueCreate(
             DT_ACTION_QUEUE_LEN,
@@ -1458,6 +2360,13 @@ esp_err_t dt_runtime_start(void)
     ESP_ERROR_CHECK(
         dt_ui_set_action_handler(
             ui_action_handler,
+            NULL
+        )
+    );
+
+    ESP_ERROR_CHECK(
+        dt_ui_set_file_request_handler(
+            ui_file_request_handler,
             NULL
         )
     );
