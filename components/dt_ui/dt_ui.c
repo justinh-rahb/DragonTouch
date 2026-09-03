@@ -84,6 +84,19 @@ typedef struct {
     /* DT_STAGE4_FILES */
     dt_ui_files_model_t files_model;
 
+    /* DT_STAGE5_FILAMENT */
+    dt_ui_filament_model_t filament_model;
+
+    lv_obj_t *filament_mode_text;
+    lv_obj_t *filament_capability_text;
+    lv_obj_t *filament_nozzle_text;
+    lv_obj_t *filament_load_button;
+    lv_obj_t *filament_unload_button;
+    lv_obj_t *filament_extrude_button;
+    lv_obj_t *filament_retract_button;
+    lv_obj_t *filament_heat_button;
+
+
     lv_obj_t *file_path_text;
     lv_obj_t *file_status_text;
     lv_obj_t *file_entry_buttons[DT_UI_FILE_ENTRY_MAX];
@@ -492,6 +505,23 @@ static const dt_confirmation_t CONFIRM_RETRACT = {
     "Retract 10 mm",
     false,
     DT_UI_ACTION_RETRACT_10,
+};
+
+
+static const dt_confirmation_t CONFIRM_FILAMENT_LOAD = {
+    "Run filament load?",
+    "DragonTouch will invoke the printer-provided LOAD_FILAMENT macro. The macro remains authoritative over heating and motion.",
+    "Load filament",
+    false,
+    DT_UI_ACTION_FILAMENT_LOAD,
+};
+
+static const dt_confirmation_t CONFIRM_FILAMENT_UNLOAD = {
+    "Run filament unload?",
+    "DragonTouch will invoke the printer-provided UNLOAD_FILAMENT macro. The macro remains authoritative over heating and motion.",
+    "Unload filament",
+    false,
+    DT_UI_ACTION_FILAMENT_UNLOAD,
 };
 
 
@@ -1733,6 +1763,296 @@ static void create_control_page(lv_obj_t *page)
     );
 }
 
+
+static void render_filament_model(void)
+{
+    if (s_ui.filament_mode_text == NULL) {
+        return;
+    }
+
+    const dt_ui_filament_model_t *model =
+        &s_ui.filament_model;
+
+    if (!model->online) {
+        lv_label_set_text(
+            s_ui.filament_mode_text,
+            "Printer offline"
+        );
+    } else if (!model->capabilities_known) {
+        lv_label_set_text(
+            s_ui.filament_mode_text,
+            "Detecting printer capabilities..."
+        );
+    } else {
+        lv_label_set_text_fmt(
+            s_ui.filament_mode_text,
+            "Mode: %s",
+            model->mode[0] != '\0'
+                ? model->mode
+                : "Standard extruder"
+        );
+    }
+
+    char capability[192] = {0};
+
+    if (!model->capabilities_known) {
+        snprintf(
+            capability,
+            sizeof(capability),
+            "Moonraker object discovery pending."
+        );
+    } else {
+        snprintf(
+            capability,
+            sizeof(capability),
+            "LOAD_FILAMENT: %s\n"
+            "UNLOAD_FILAMENT: %s\n"
+            "M600: %s\n"
+            "AFC: %s  |  MMU: %s  |  Toolchanger: %s",
+            model->has_load_macro ? "yes" : "no",
+            model->has_unload_macro ? "yes" : "no",
+            model->has_m600 ? "yes" : "no",
+            model->afc_detected ? "yes" : "no",
+            model->mmu_detected ? "yes" : "no",
+            model->toolchanger_detected ? "yes" : "no"
+        );
+    }
+
+    lv_label_set_text(
+        s_ui.filament_capability_text,
+        capability
+    );
+
+    /*
+     * DT_STAGE5_NO_LVGL_FLOAT_FMT
+     *
+     * Do not feed floating-point varargs to LVGL's builtin formatter on
+     * this target. Format with libc first, then give LVGL a complete string.
+     */
+    if (
+        model->online &&
+        isfinite(model->nozzle_c) &&
+        isfinite(model->nozzle_target_c)
+    ) {
+        char nozzle_text[96] = {0};
+
+        snprintf(
+            nozzle_text,
+            sizeof(nozzle_text),
+            "%.1f / %.0f °C%s",
+            (double)model->nozzle_c,
+            (double)model->nozzle_target_c,
+            model->can_extrude
+                ? "  |  extrusion ready"
+                : ""
+        );
+
+        lv_label_set_text(
+            s_ui.filament_nozzle_text,
+            nozzle_text
+        );
+    } else {
+        lv_label_set_text(
+            s_ui.filament_nozzle_text,
+            "Temperature unavailable"
+        );
+    }
+
+    set_button_enabled(
+        s_ui.filament_load_button,
+        model->online &&
+            model->capabilities_known &&
+            model->has_load_macro
+    );
+
+    set_button_enabled(
+        s_ui.filament_unload_button,
+        model->online &&
+            model->capabilities_known &&
+            model->has_unload_macro
+    );
+
+    set_button_enabled(
+        s_ui.filament_extrude_button,
+        model->online &&
+            model->can_extrude
+    );
+
+    set_button_enabled(
+        s_ui.filament_retract_button,
+        model->online &&
+            model->can_extrude
+    );
+
+    set_button_enabled(
+        s_ui.filament_heat_button,
+        model->online
+    );
+}
+
+
+/*
+ * DT_STAGE5_COMPACT_FILAMENT_PAGE
+ *
+ * Keep the Filament page deliberately shallow. The previous Stage 5
+ * implementation nested three full-height flex cards inside a row panel.
+ * That layout is unnecessary on the 800x480 target and creates a much
+ * larger LVGL object/layout tree during lazy page construction.
+ *
+ * This page uses one resident card with two action rows.
+ */
+static void create_filament_page(lv_obj_t *page)
+{
+    ESP_LOGI(TAG, "FILAMENT_BUILD begin");
+
+    lv_obj_t *heading_row =
+        create_page_heading(
+            page,
+            "Filament",
+            "Capability-aware controls for the connected printer."
+        );
+
+    ESP_LOGI(TAG, "FILAMENT_BUILD heading");
+
+    lv_obj_t *status =
+        make_label(
+            heading_row,
+            "Detecting...",
+            DT_COLOR_MUTED
+        );
+
+    lv_obj_set_flex_grow(status, 1);
+
+    lv_obj_set_style_text_align(
+        status,
+        LV_TEXT_ALIGN_RIGHT,
+        0
+    );
+
+    ESP_LOGI(TAG, "FILAMENT_BUILD status");
+
+    lv_obj_t *card =
+        make_card(
+            page,
+            "FILAMENT SYSTEM"
+        );
+
+    lv_obj_set_width(card, LV_PCT(100));
+    lv_obj_set_flex_grow(card, 1);
+
+    ESP_LOGI(TAG, "FILAMENT_BUILD card");
+
+    s_ui.filament_mode_text =
+        make_label(
+            card,
+            "Detecting printer capabilities...",
+            DT_COLOR_TEXT
+        );
+
+    lv_label_set_long_mode(
+        s_ui.filament_mode_text,
+        LV_LABEL_LONG_MODE_WRAP
+    );
+
+    lv_obj_set_width(
+        s_ui.filament_mode_text,
+        LV_PCT(100)
+    );
+
+    s_ui.filament_capability_text =
+        make_label(
+            card,
+            "Moonraker object discovery pending.",
+            DT_COLOR_MUTED
+        );
+
+    lv_label_set_long_mode(
+        s_ui.filament_capability_text,
+        LV_LABEL_LONG_MODE_WRAP
+    );
+
+    lv_obj_set_width(
+        s_ui.filament_capability_text,
+        LV_PCT(100)
+    );
+
+    s_ui.filament_nozzle_text =
+        make_label(
+            card,
+            "Temperature unavailable",
+            DT_COLOR_TEXT
+        );
+
+    lv_obj_set_width(
+        s_ui.filament_nozzle_text,
+        LV_PCT(100)
+    );
+
+    ESP_LOGI(TAG, "FILAMENT_BUILD labels");
+
+    lv_obj_t *macro_row =
+        lv_obj_create(card);
+
+    lv_obj_remove_style_all(macro_row);
+    lv_obj_set_size(macro_row, LV_PCT(100), 42);
+    lv_obj_set_layout(macro_row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(macro_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(macro_row, 8, 0);
+
+    s_ui.filament_load_button =
+        make_guarded_action(
+            macro_row,
+            "Load",
+            &CONFIRM_FILAMENT_LOAD
+        );
+
+    s_ui.filament_unload_button =
+        make_guarded_action(
+            macro_row,
+            "Unload",
+            &CONFIRM_FILAMENT_UNLOAD
+        );
+
+    ESP_LOGI(TAG, "FILAMENT_BUILD macro-actions");
+
+    lv_obj_t *manual_row =
+        lv_obj_create(card);
+
+    lv_obj_remove_style_all(manual_row);
+    lv_obj_set_size(manual_row, LV_PCT(100), 42);
+    lv_obj_set_layout(manual_row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(manual_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(manual_row, 8, 0);
+
+    s_ui.filament_extrude_button =
+        make_guarded_action(
+            manual_row,
+            "Extrude 10",
+            &CONFIRM_EXTRUDE
+        );
+
+    s_ui.filament_retract_button =
+        make_guarded_action(
+            manual_row,
+            "Retract 10",
+            &CONFIRM_RETRACT
+        );
+
+    s_ui.filament_heat_button =
+        make_guarded_action(
+            manual_row,
+            "220 C",
+            &CONFIRM_HEAT
+        );
+
+    ESP_LOGI(TAG, "FILAMENT_BUILD manual-actions");
+
+    render_filament_model();
+
+    ESP_LOGI(TAG, "FILAMENT_BUILD complete");
+}
+
+
 static void create_files_page(lv_obj_t *page)
 {
     static const char *names[] = {
@@ -2041,6 +2361,17 @@ static void recycle_secondary_pages(
             }
         }
 
+        if (page == DT_UI_PAGE_FILAMENT) {
+            s_ui.filament_mode_text = NULL;
+            s_ui.filament_capability_text = NULL;
+            s_ui.filament_nozzle_text = NULL;
+            s_ui.filament_load_button = NULL;
+            s_ui.filament_unload_button = NULL;
+            s_ui.filament_extrude_button = NULL;
+            s_ui.filament_retract_button = NULL;
+            s_ui.filament_heat_button = NULL;
+        }
+
         s_ui.page_built[page] =
             false;
 
@@ -2097,23 +2428,11 @@ static void ensure_page_built(dt_ui_page_t page)
         );
         break;
 
-    case DT_UI_PAGE_FILAMENT: {
-        static const char *cards[] = {
-            "ACTIVE TOOL",
-            "MATERIAL SLOTS",
-            "LOAD / UNLOAD"
-        };
-
-        create_stub_page(
-            s_ui.pages[DT_UI_PAGE_FILAMENT],
-            "Filament",
-            "Tool and material controls adapt "
-            "to the selected printer's capabilities.",
-            cards,
-            3
+    case DT_UI_PAGE_FILAMENT:
+        create_filament_page(
+            s_ui.pages[DT_UI_PAGE_FILAMENT]
         );
         break;
-    }
 
     case DT_UI_PAGE_DEVICES: {
         static const char *cards[] = {
@@ -2765,6 +3084,29 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
     return ESP_OK;
 }
 
+
+
+
+esp_err_t dt_ui_update_filament(
+    const dt_ui_filament_model_t *model
+)
+{
+    if (!s_ui.ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (model == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_ui.filament_model = *model;
+
+    if (s_ui.page_built[DT_UI_PAGE_FILAMENT]) {
+        render_filament_model();
+    }
+
+    return ESP_OK;
+}
 
 
 esp_err_t dt_ui_update_files(

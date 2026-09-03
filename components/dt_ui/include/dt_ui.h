@@ -88,6 +88,28 @@ typedef void (*dt_ui_file_request_handler_t)(
 );
 
 
+typedef struct {
+    bool online;
+    bool capabilities_known;
+    bool can_extrude;
+
+    float nozzle_c;
+    float nozzle_target_c;
+
+    bool has_load_macro;
+    bool has_unload_macro;
+    bool has_m600;
+
+    bool afc_detected;
+    bool mmu_detected;
+    bool toolchanger_detected;
+
+    char load_macro[48];
+    char unload_macro[48];
+    char mode[64];
+} dt_ui_filament_model_t;
+
+
 typedef enum {
     DT_UI_ACTION_PAUSE = 0,
     DT_UI_ACTION_RESUME,
@@ -115,6 +137,8 @@ typedef enum {
     DT_UI_ACTION_FAN_50,
     DT_UI_ACTION_FAN_100,
     DT_UI_ACTION_FILE_START_SELECTED,
+    DT_UI_ACTION_FILAMENT_LOAD,
+    DT_UI_ACTION_FILAMENT_UNLOAD,
 } dt_ui_action_t;
 
 typedef void (*dt_ui_action_handler_t)(
@@ -159,6 +183,10 @@ typedef struct {
 esp_err_t dt_ui_create(lv_display_t *display);
 esp_err_t dt_ui_update(const dt_ui_model_t *model);
 esp_err_t dt_ui_show_page(dt_ui_page_t page);
+
+esp_err_t dt_ui_update_filament(
+    const dt_ui_filament_model_t *model
+);
 
 esp_err_t dt_ui_update_files(
     const dt_ui_files_model_t *model

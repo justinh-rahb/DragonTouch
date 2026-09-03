@@ -81,6 +81,7 @@ static void runtime_heap_diag(const char *where)
 #define DT_HTTP_RESPONSE_MAX  12288
 #define DT_ACTION_QUEUE_LEN   12
 #define DT_FILE_QUEUE_LEN     4
+#define DT_CAPABILITY_PERIOD_MS 30000
 
 
 typedef struct {
@@ -129,6 +130,7 @@ typedef struct {
 static QueueHandle_t s_action_queue;
 static QueueHandle_t s_file_queue;
 static dt_ui_files_model_t *s_files_model;
+static dt_ui_filament_model_t *s_filament_model;
 static char s_selected_file[DT_UI_FILE_PATH_MAX];
 
 static char s_moonraker_host[128];
@@ -1228,6 +1230,277 @@ static esp_err_t files_handle_request(
 
 
 
+
+static bool string_contains_ci(
+    const char *text,
+    const char *needle
+)
+{
+    if (
+        text == NULL ||
+        needle == NULL ||
+        needle[0] == '\0'
+    ) {
+        return false;
+    }
+
+    const size_t needle_len =
+        strlen(needle);
+
+    for (
+        const char *p = text;
+        *p != '\0';
+        ++p
+    ) {
+        if (
+            strncasecmp(
+                p,
+                needle,
+                needle_len
+            ) == 0
+        ) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+static void push_filament_ui(void)
+{
+    if (s_filament_model == NULL) {
+        return;
+    }
+
+    if (!lvgl_port_lock(200)) {
+        ESP_LOGW(
+            TAG,
+            "LVGL lock timeout; skipping filament UI update"
+        );
+        return;
+    }
+
+    esp_err_t err =
+        dt_ui_update_filament(
+            s_filament_model
+        );
+
+    lvgl_port_unlock();
+
+    if (err != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "dt_ui_update_filament: %s",
+            esp_err_to_name(err)
+        );
+    }
+}
+
+
+static esp_err_t discover_filament_capabilities(void)
+{
+    if (s_filament_model == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char *response = NULL;
+
+    esp_err_t err =
+        http_request(
+            HTTP_METHOD_GET,
+            "/printer/objects/list",
+            NULL,
+            &response,
+            NULL
+        );
+
+    if (err != ESP_OK) {
+        s_filament_model->capabilities_known = false;
+        push_filament_ui();
+        return err;
+    }
+
+    cJSON *root =
+        cJSON_Parse(response);
+
+    free(response);
+
+    if (root == NULL) {
+        return ESP_FAIL;
+    }
+
+    cJSON *payload =
+        moonraker_payload(root);
+
+    cJSON *objects =
+        cJSON_GetObjectItemCaseSensitive(
+            payload,
+            "objects"
+        );
+
+    if (!cJSON_IsArray(objects)) {
+        cJSON_Delete(root);
+        return ESP_FAIL;
+    }
+
+    s_filament_model->has_load_macro = false;
+    s_filament_model->has_unload_macro = false;
+    s_filament_model->has_m600 = false;
+    s_filament_model->afc_detected = false;
+    s_filament_model->mmu_detected = false;
+    s_filament_model->toolchanger_detected = false;
+    s_filament_model->load_macro[0] = '\0';
+    s_filament_model->unload_macro[0] = '\0';
+
+    cJSON *item = NULL;
+
+    cJSON_ArrayForEach(item, objects) {
+        if (
+            !cJSON_IsString(item) ||
+            item->valuestring == NULL
+        ) {
+            continue;
+        }
+
+        const char *object =
+            item->valuestring;
+
+        if (
+            string_contains_ci(object, "afc") ||
+            string_contains_ci(object, "boxturtle")
+        ) {
+            s_filament_model->afc_detected = true;
+        }
+
+        if (
+            string_contains_ci(object, "mmu") ||
+            string_contains_ci(object, "ercf") ||
+            string_contains_ci(object, "happy_hare")
+        ) {
+            s_filament_model->mmu_detected = true;
+        }
+
+        if (
+            string_contains_ci(object, "toolchanger") ||
+            string_contains_ci(object, "tool_changer") ||
+            string_contains_ci(object, "stealthchanger") ||
+            string_contains_ci(object, "tapchanger")
+        ) {
+            s_filament_model->toolchanger_detected = true;
+        }
+
+        const char *prefix =
+            "gcode_macro ";
+
+        const size_t prefix_len =
+            strlen(prefix);
+
+        if (
+            strncasecmp(
+                object,
+                prefix,
+                prefix_len
+            ) != 0
+        ) {
+            continue;
+        }
+
+        const char *macro =
+            object + prefix_len;
+
+        if (
+            strcasecmp(
+                macro,
+                "LOAD_FILAMENT"
+            ) == 0
+        ) {
+            s_filament_model->has_load_macro = true;
+
+            snprintf(
+                s_filament_model->load_macro,
+                sizeof(s_filament_model->load_macro),
+                "LOAD_FILAMENT"
+            );
+        } else if (
+            strcasecmp(
+                macro,
+                "UNLOAD_FILAMENT"
+            ) == 0
+        ) {
+            s_filament_model->has_unload_macro = true;
+
+            snprintf(
+                s_filament_model->unload_macro,
+                sizeof(s_filament_model->unload_macro),
+                "UNLOAD_FILAMENT"
+            );
+        } else if (
+            strcasecmp(
+                macro,
+                "M600"
+            ) == 0
+        ) {
+            s_filament_model->has_m600 = true;
+        }
+    }
+
+    cJSON_Delete(root);
+
+    if (s_filament_model->afc_detected) {
+        snprintf(
+            s_filament_model->mode,
+            sizeof(s_filament_model->mode),
+            "AFC / managed filament"
+        );
+    } else if (s_filament_model->mmu_detected) {
+        snprintf(
+            s_filament_model->mode,
+            sizeof(s_filament_model->mode),
+            "MMU / managed filament"
+        );
+    } else if (s_filament_model->toolchanger_detected) {
+        snprintf(
+            s_filament_model->mode,
+            sizeof(s_filament_model->mode),
+            "Toolchanger / multi-tool"
+        );
+    } else if (
+        s_filament_model->has_load_macro ||
+        s_filament_model->has_unload_macro
+    ) {
+        snprintf(
+            s_filament_model->mode,
+            sizeof(s_filament_model->mode),
+            "Printer filament macros"
+        );
+    } else {
+        snprintf(
+            s_filament_model->mode,
+            sizeof(s_filament_model->mode),
+            "Manual extruder"
+        );
+    }
+
+    s_filament_model->capabilities_known = true;
+
+    ESP_LOGI(
+        TAG,
+        "filament capabilities load=%d unload=%d m600=%d afc=%d mmu=%d toolchanger=%d",
+        s_filament_model->has_load_macro,
+        s_filament_model->has_unload_macro,
+        s_filament_model->has_m600,
+        s_filament_model->afc_detected,
+        s_filament_model->mmu_detected,
+        s_filament_model->toolchanger_detected
+    );
+
+    push_filament_ui();
+
+    return ESP_OK;
+}
+
+
 static bool query_status(
     runtime_snapshot_t *snap
 )
@@ -1881,6 +2154,36 @@ static esp_err_t start_selected_file(void)
 }
 
 
+
+static esp_err_t execute_filament_macro(
+    bool load
+)
+{
+    if (s_filament_model == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const bool available =
+        load
+            ? s_filament_model->has_load_macro
+            : s_filament_model->has_unload_macro;
+
+    const char *macro =
+        load
+            ? s_filament_model->load_macro
+            : s_filament_model->unload_macro;
+
+    if (
+        !available ||
+        macro[0] == '\0'
+    ) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    return run_gcode(macro);
+}
+
+
 static esp_err_t execute_action(
     dt_ui_action_t action
 )
@@ -2000,6 +2303,12 @@ static esp_err_t execute_action(
     case DT_UI_ACTION_FILE_START_SELECTED:
         return start_selected_file();
 
+    case DT_UI_ACTION_FILAMENT_LOAD:
+        return execute_filament_macro(true);
+
+    case DT_UI_ACTION_FILAMENT_UNLOAD:
+        return execute_filament_macro(false);
+
     default:
         return ESP_ERR_NOT_SUPPORTED;
     }
@@ -2096,6 +2405,13 @@ static void runtime_task(void *arg)
         (void)files_refresh_directory();
     }
 
+    if (s_filament_model != NULL) {
+        (void)discover_filament_capabilities();
+    }
+
+    TickType_t last_capability_check =
+        xTaskGetTickCount();
+
     for (;;) {
         dt_runtime_file_request_t file_request;
 
@@ -2168,6 +2484,17 @@ static void runtime_task(void *arg)
             runtime_snapshot_t snap;
             const bool online = query_status(&snap);
 
+            if (s_filament_model != NULL) {
+                s_filament_model->online = online;
+                s_filament_model->nozzle_c = snap.nozzle_c;
+                s_filament_model->nozzle_target_c =
+                    snap.nozzle_target_c;
+                s_filament_model->can_extrude =
+                    snap.can_extrude;
+
+                push_filament_ui();
+            }
+
             if (online) {
                 failure_count = 0;
             } else {
@@ -2208,6 +2535,23 @@ static void runtime_task(void *arg)
                     snap.y,
                     snap.z
                 );
+            }
+        }
+
+        const TickType_t capability_now =
+            xTaskGetTickCount();
+
+        if (
+            capability_now - last_capability_check >=
+            pdMS_TO_TICKS(DT_CAPABILITY_PERIOD_MS)
+        ) {
+            last_capability_check = capability_now;
+
+            if (
+                s_filament_model != NULL &&
+                s_base_url[0] != '\0'
+            ) {
+                (void)discover_filament_capabilities();
             }
         }
 
@@ -2336,6 +2680,20 @@ esp_err_t dt_runtime_start(void)
         sizeof(s_files_model->directory),
         "gcodes"
     );
+
+    s_filament_model =
+        heap_caps_calloc(
+            1,
+            sizeof(*s_filament_model),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        );
+
+    if (s_filament_model == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_filament_model->nozzle_c = NAN;
+    s_filament_model->nozzle_target_c = NAN;
 
     s_file_queue =
         xQueueCreate(
