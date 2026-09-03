@@ -205,53 +205,6 @@ static esp_err_t http_event(
 }
 
 
-static bool load_nvs_string(
-    const char *key,
-    char *out,
-    size_t out_len
-)
-{
-    if (out_len == 0) {
-        return false;
-    }
-
-    out[0] = '\0';
-
-    nvs_handle_t handle;
-
-    if (
-        nvs_open(
-            "app_nvs",
-            NVS_READONLY,
-            &handle
-        ) != ESP_OK
-    ) {
-        return false;
-    }
-
-    size_t needed = out_len;
-
-    esp_err_t err =
-        nvs_get_str(
-            handle,
-            key,
-            out,
-            &needed
-        );
-
-    nvs_close(handle);
-
-    if (
-        err != ESP_OK ||
-        out[0] == '\0'
-    ) {
-        out[0] = '\0';
-        return false;
-    }
-
-    return true;
-}
-
 
 static void load_moonraker_config(void)
 {
@@ -1357,35 +1310,6 @@ static void push_filament_ui(void)
 }
 
 
-
-static bool json_object_has_key_ci(
-    cJSON *object,
-    const char *name
-)
-{
-    if (
-        !cJSON_IsObject(object) ||
-        name == NULL
-    ) {
-        return false;
-    }
-
-    cJSON *item = NULL;
-
-    cJSON_ArrayForEach(item, object) {
-        if (
-            item->string != NULL &&
-            strcasecmp(
-                item->string,
-                name
-            ) == 0
-        ) {
-            return true;
-        }
-    }
-
-    return false;
-}
 
 
 
