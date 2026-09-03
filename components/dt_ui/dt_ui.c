@@ -87,6 +87,18 @@ typedef struct {
     /* DT_STAGE5_FILAMENT */
     dt_ui_filament_model_t filament_model;
 
+    /* DT_STAGE6_SYSTEM_PAGES */
+    dt_ui_system_model_t system_model;
+
+    lv_obj_t *devices_printer_text;
+    lv_obj_t *devices_network_text;
+    lv_obj_t *devices_filament_text;
+
+    lv_obj_t *settings_build_text;
+    lv_obj_t *settings_memory_text;
+    lv_obj_t *settings_portal_text;
+    lv_obj_t *settings_reboot_button;
+
     lv_obj_t *filament_mode_text;
     lv_obj_t *filament_capability_text;
     lv_obj_t *filament_nozzle_text;
@@ -540,6 +552,15 @@ static const dt_confirmation_t CONFIRM_FILAMENT_UNLOAD = {
     "Unload filament",
     false,
     DT_UI_ACTION_FILAMENT_UNLOAD,
+};
+
+
+static const dt_confirmation_t CONFIRM_SYSTEM_REBOOT = {
+    "Reboot DragonTouch?",
+    "The display controller will restart. The printer and its current print are not restarted.",
+    "Reboot",
+    false,
+    DT_UI_ACTION_SYSTEM_REBOOT,
 };
 
 
@@ -2376,6 +2397,285 @@ static void afc_next_event(lv_event_t *event)
 }
 
 
+
+static const char *system_connection_text(
+    dt_ui_connection_t connection
+)
+{
+    switch (connection) {
+    case DT_UI_CONNECTION_ONLINE:
+        return "Online";
+
+    case DT_UI_CONNECTION_CONNECTING:
+        return "Connecting";
+
+    default:
+        return "Offline";
+    }
+}
+
+
+static void render_system_model(void)
+{
+    const dt_ui_system_model_t *model =
+        &s_ui.system_model;
+
+    if (s_ui.devices_printer_text != NULL) {
+        lv_label_set_text_fmt(
+            s_ui.devices_printer_text,
+            "%s\n%s",
+            system_connection_text(
+                model->printer_connection
+            ),
+            model->moonraker_url[0] != '\0'
+                ? model->moonraker_url
+                : "Moonraker not configured"
+        );
+    }
+
+    if (s_ui.devices_network_text != NULL) {
+        lv_label_set_text_fmt(
+            s_ui.devices_network_text,
+            "%s  |  RSSI %d dBm\nIP %s",
+            model->wifi_ssid[0] != '\0'
+                ? model->wifi_ssid
+                : "Wi-Fi unavailable",
+            model->wifi_rssi,
+            model->local_ip[0] != '\0'
+                ? model->local_ip
+                : "--"
+        );
+    }
+
+    if (s_ui.devices_filament_text != NULL) {
+        lv_label_set_text_fmt(
+            s_ui.devices_filament_text,
+            "%s\nAFC lanes: %u",
+            model->filament_mode[0] != '\0'
+                ? model->filament_mode
+                : "Standard extruder",
+            (unsigned)model->afc_lane_count
+        );
+    }
+
+    if (s_ui.settings_build_text != NULL) {
+        lv_label_set_text_fmt(
+            s_ui.settings_build_text,
+            "DragonTouch %s\nESP-IDF %s",
+            model->firmware_version[0] != '\0'
+                ? model->firmware_version
+                : "--",
+            model->idf_version[0] != '\0'
+                ? model->idf_version
+                : "--"
+        );
+    }
+
+    if (s_ui.settings_memory_text != NULL) {
+        lv_label_set_text_fmt(
+            s_ui.settings_memory_text,
+            "Internal: %u free | %u largest\n"
+            "PSRAM: %u free | %u largest",
+            (unsigned)model->internal_free,
+            (unsigned)model->internal_largest,
+            (unsigned)model->psram_free,
+            (unsigned)model->psram_largest
+        );
+    }
+
+    if (s_ui.settings_portal_text != NULL) {
+        char portal[192] = {0};
+
+        if (model->local_ip[0] != '\0') {
+            snprintf(
+                portal,
+                sizeof(portal),
+                "Printer setup:\nhttp://%s/dragontouch",
+                model->local_ip
+            );
+        } else {
+            snprintf(
+                portal,
+                sizeof(portal),
+                "Printer setup:\nhttp://192.168.4.1/dragontouch"
+            );
+        }
+
+        lv_label_set_text(
+            s_ui.settings_portal_text,
+            portal
+        );
+    }
+
+    /*
+     * DT_STAGE6_NULL_SAFE_REBOOT_BUTTON
+     *
+     * Devices and Settings are lazy/recycled pages. render_system_model()
+     * is shared by both, so the Settings-only reboot button may legitimately
+     * be NULL while the Devices page is being built.
+     */
+    if (s_ui.settings_reboot_button != NULL) {
+        set_button_enabled(
+            s_ui.settings_reboot_button,
+            true
+        );
+    }
+}
+
+
+static void create_devices_page(lv_obj_t *page)
+{
+    create_page_heading(
+        page,
+        "Devices",
+        "Connected printer, network, and filament-system status."
+    );
+
+    lv_obj_t *printer =
+        make_control_card(
+            page,
+            "PRINTER",
+            "Waiting for runtime status..."
+        );
+
+    s_ui.devices_printer_text =
+        lv_obj_get_child(
+            printer,
+            1
+        );
+
+    lv_label_set_long_mode(
+        s_ui.devices_printer_text,
+        LV_LABEL_LONG_MODE_WRAP
+    );
+
+    lv_obj_set_width(
+        s_ui.devices_printer_text,
+        LV_PCT(100)
+    );
+
+    lv_obj_t *network =
+        make_control_card(
+            page,
+            "NETWORK",
+            "Waiting for Wi-Fi status..."
+        );
+
+    s_ui.devices_network_text =
+        lv_obj_get_child(
+            network,
+            1
+        );
+
+    lv_label_set_long_mode(
+        s_ui.devices_network_text,
+        LV_LABEL_LONG_MODE_WRAP
+    );
+
+    lv_obj_set_width(
+        s_ui.devices_network_text,
+        LV_PCT(100)
+    );
+
+    lv_obj_t *filament =
+        make_control_card(
+            page,
+            "FILAMENT SYSTEM",
+            "Waiting for capability discovery..."
+        );
+
+    s_ui.devices_filament_text =
+        lv_obj_get_child(
+            filament,
+            1
+        );
+
+    lv_label_set_long_mode(
+        s_ui.devices_filament_text,
+        LV_LABEL_LONG_MODE_WRAP
+    );
+
+    lv_obj_set_width(
+        s_ui.devices_filament_text,
+        LV_PCT(100)
+    );
+
+    render_system_model();
+}
+
+
+static void create_settings_page(lv_obj_t *page)
+{
+    create_page_heading(
+        page,
+        "Settings",
+        "DragonTouch diagnostics and local configuration access."
+    );
+
+    lv_obj_t *build =
+        make_control_card(
+            page,
+            "SOFTWARE",
+            "Version unavailable"
+        );
+
+    s_ui.settings_build_text =
+        lv_obj_get_child(
+            build,
+            1
+        );
+
+    lv_obj_t *memory =
+        make_control_card(
+            page,
+            "MEMORY",
+            "Heap diagnostics unavailable"
+        );
+
+    s_ui.settings_memory_text =
+        lv_obj_get_child(
+            memory,
+            1
+        );
+
+    lv_obj_t *portal =
+        make_control_card(
+            page,
+            "WEB CONFIGURATION",
+            "Printer setup URL unavailable"
+        );
+
+    s_ui.settings_portal_text =
+        lv_obj_get_child(
+            portal,
+            1
+        );
+
+    lv_label_set_long_mode(
+        s_ui.settings_portal_text,
+        LV_LABEL_LONG_MODE_WRAP
+    );
+
+    lv_obj_set_width(
+        s_ui.settings_portal_text,
+        LV_PCT(100)
+    );
+
+    s_ui.settings_reboot_button =
+        make_guarded_action(
+            portal,
+            "Reboot DragonTouch",
+            &CONFIRM_SYSTEM_REBOOT
+        );
+
+    size_card_action(
+        s_ui.settings_reboot_button
+    );
+
+    render_system_model();
+}
+
+
 static void create_filament_page(lv_obj_t *page)
 {
     ESP_LOGI(TAG, "FILAMENT_BUILD begin");
@@ -3098,6 +3398,19 @@ static void recycle_secondary_pages(
             }
         }
 
+        if (page == DT_UI_PAGE_DEVICES) {
+            s_ui.devices_printer_text = NULL;
+            s_ui.devices_network_text = NULL;
+            s_ui.devices_filament_text = NULL;
+        }
+
+        if (page == DT_UI_PAGE_SETTINGS) {
+            s_ui.settings_build_text = NULL;
+            s_ui.settings_memory_text = NULL;
+            s_ui.settings_portal_text = NULL;
+            s_ui.settings_reboot_button = NULL;
+        }
+
         s_ui.page_built[page] =
             false;
 
@@ -3160,42 +3473,17 @@ static void ensure_page_built(dt_ui_page_t page)
         );
         break;
 
-    case DT_UI_PAGE_DEVICES: {
-        static const char *cards[] = {
-            "SELECTED PRINTER",
-            "DISCOVERED DEVICES",
-            "DRAGON GROUP"
-        };
-
-        create_stub_page(
-            s_ui.pages[DT_UI_PAGE_DEVICES],
-            "Devices",
-            "Discover and explicitly pair "
-            "same-LAN printers and Dragon-family siblings.",
-            cards,
-            3
+    case DT_UI_PAGE_DEVICES:
+        create_devices_page(
+            s_ui.pages[DT_UI_PAGE_DEVICES]
         );
         break;
-    }
 
-    case DT_UI_PAGE_SETTINGS: {
-        static const char *cards[] = {
-            "WI-FI",
-            "DISPLAY",
-            "UPDATE & RECOVERY",
-            "ABOUT"
-        };
-
-        create_stub_page(
-            s_ui.pages[DT_UI_PAGE_SETTINGS],
-            "Settings",
-            "Device-local preferences, provisioning, "
-            "diagnostics, and recovery.",
-            cards,
-            4
+    case DT_UI_PAGE_SETTINGS:
+        create_settings_page(
+            s_ui.pages[DT_UI_PAGE_SETTINGS]
         );
         break;
-    }
 
     default:
         return;
@@ -3811,6 +4099,32 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
 }
 
 
+
+
+
+esp_err_t dt_ui_update_system(
+    const dt_ui_system_model_t *model
+)
+{
+    if (!s_ui.ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (model == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_ui.system_model = *model;
+
+    if (
+        s_ui.page_built[DT_UI_PAGE_DEVICES] ||
+        s_ui.page_built[DT_UI_PAGE_SETTINGS]
+    ) {
+        render_system_model();
+    }
+
+    return ESP_OK;
+}
 
 
 esp_err_t dt_ui_update_filament(

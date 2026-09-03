@@ -162,6 +162,28 @@ typedef void (*dt_ui_filament_request_handler_t)(
 );
 
 
+typedef struct {
+    dt_ui_connection_t printer_connection;
+
+    char wifi_ssid[40];
+    int wifi_rssi;
+    char local_ip[24];
+
+    char moonraker_url[160];
+
+    char filament_mode[64];
+    size_t afc_lane_count;
+
+    char firmware_version[48];
+    char idf_version[48];
+
+    uint32_t internal_free;
+    uint32_t internal_largest;
+    uint32_t psram_free;
+    uint32_t psram_largest;
+} dt_ui_system_model_t;
+
+
 typedef enum {
     DT_UI_ACTION_PAUSE = 0,
     DT_UI_ACTION_RESUME,
@@ -191,6 +213,7 @@ typedef enum {
     DT_UI_ACTION_FILE_START_SELECTED,
     DT_UI_ACTION_FILAMENT_LOAD,
     DT_UI_ACTION_FILAMENT_UNLOAD,
+    DT_UI_ACTION_SYSTEM_REBOOT,
 } dt_ui_action_t;
 
 typedef void (*dt_ui_action_handler_t)(
@@ -235,6 +258,10 @@ typedef struct {
 esp_err_t dt_ui_create(lv_display_t *display);
 esp_err_t dt_ui_update(const dt_ui_model_t *model);
 esp_err_t dt_ui_show_page(dt_ui_page_t page);
+
+esp_err_t dt_ui_update_system(
+    const dt_ui_system_model_t *model
+);
 
 esp_err_t dt_ui_update_filament(
     const dt_ui_filament_model_t *model

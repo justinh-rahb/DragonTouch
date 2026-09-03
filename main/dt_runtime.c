@@ -17,6 +17,9 @@
 #include "dt_ui.h"
 
 #include "esp_heap_caps.h"
+#include "esp_system.h"
+#include "esp_netif.h"
+#include "esp_app_desc.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
@@ -85,6 +88,7 @@ static void runtime_heap_diag(const char *where)
 #define DT_ACTION_QUEUE_LEN   12
 #define DT_FILE_QUEUE_LEN     4
 #define DT_CAPABILITY_PERIOD_MS 30000
+#define DT_SYSTEM_PERIOD_MS 5000
 #define DT_AFC_STATUS_PERIOD_MS 2000
 #define DT_FILAMENT_QUEUE_LEN 4
 
@@ -2193,6 +2197,209 @@ static esp_err_t execute_afc_lane_request(
 
 
 
+
+static void runtime_copy_text(
+    char *dest,
+    size_t dest_size,
+    const char *src
+)
+{
+    if (
+        dest == NULL ||
+        dest_size == 0
+    ) {
+        return;
+    }
+
+    if (src == NULL) {
+        dest[0] = '\0';
+        return;
+    }
+
+    const size_t src_len =
+        strlen(src);
+
+    const size_t copy_len =
+        src_len < dest_size - 1U
+            ? src_len
+            : dest_size - 1U;
+
+    memcpy(
+        dest,
+        src,
+        copy_len
+    );
+
+    dest[copy_len] = '\0';
+}
+
+
+static void collect_system_model(
+    dt_ui_system_model_t *model
+)
+{
+    memset(
+        model,
+        0,
+        sizeof(*model)
+    );
+
+    model->wifi_rssi = 0;
+
+    if (s_have_previous) {
+        model->printer_connection =
+            s_previous.connection;
+    } else {
+        model->printer_connection =
+            s_base_url[0] != '\0'
+                ? DT_UI_CONNECTION_CONNECTING
+                : DT_UI_CONNECTION_OFFLINE;
+    }
+
+    runtime_copy_text(
+        model->moonraker_url,
+        sizeof(model->moonraker_url),
+        s_base_url
+    );
+
+    if (s_filament_model != NULL) {
+        runtime_copy_text(
+            model->filament_mode,
+            sizeof(model->filament_mode),
+            s_filament_model->mode
+        );
+
+        model->afc_lane_count =
+            s_filament_model->afc_lane_count;
+    }
+
+    wifi_ap_record_t ap = {0};
+
+    if (
+        esp_wifi_sta_get_ap_info(
+            &ap
+        ) == ESP_OK
+    ) {
+        const size_t ssid_len =
+            strnlen(
+                (const char *)ap.ssid,
+                sizeof(ap.ssid)
+            );
+
+        const size_t copy_len =
+            ssid_len <
+                sizeof(model->wifi_ssid) - 1U
+                ? ssid_len
+                : sizeof(model->wifi_ssid) - 1U;
+
+        memcpy(
+            model->wifi_ssid,
+            ap.ssid,
+            copy_len
+        );
+
+        model->wifi_ssid[copy_len] = '\0';
+
+        model->wifi_rssi =
+            (int)ap.rssi;
+    }
+
+    esp_netif_t *sta =
+        esp_netif_get_handle_from_ifkey(
+            "WIFI_STA_DEF"
+        );
+
+    if (sta != NULL) {
+        esp_netif_ip_info_t ip_info = {0};
+
+        if (
+            esp_netif_get_ip_info(
+                sta,
+                &ip_info
+            ) == ESP_OK &&
+            ip_info.ip.addr != 0
+        ) {
+            snprintf(
+                model->local_ip,
+                sizeof(model->local_ip),
+                IPSTR,
+                IP2STR(&ip_info.ip)
+            );
+        }
+    }
+
+    const esp_app_desc_t *app =
+        esp_app_get_description();
+
+    if (app != NULL) {
+        runtime_copy_text(
+            model->firmware_version,
+            sizeof(model->firmware_version),
+            app->version
+        );
+    }
+
+    runtime_copy_text(
+        model->idf_version,
+        sizeof(model->idf_version),
+        esp_get_idf_version()
+    );
+
+    model->internal_free =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_INTERNAL
+        );
+
+    model->internal_largest =
+        (uint32_t)heap_caps_get_largest_free_block(
+            MALLOC_CAP_INTERNAL
+        );
+
+    model->psram_free =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_SPIRAM
+        );
+
+    model->psram_largest =
+        (uint32_t)heap_caps_get_largest_free_block(
+            MALLOC_CAP_SPIRAM
+        );
+}
+
+
+static void push_system_ui(void)
+{
+    dt_ui_system_model_t model;
+
+    collect_system_model(
+        &model
+    );
+
+    if (!lvgl_port_lock(200)) {
+        ESP_LOGW(
+            TAG,
+            "LVGL lock timeout; skipping system UI update"
+        );
+        return;
+    }
+
+    esp_err_t err =
+        dt_ui_update_system(
+            &model
+        );
+
+    lvgl_port_unlock();
+
+    if (err != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "dt_ui_update_system: %s",
+            esp_err_to_name(err)
+        );
+    }
+}
+
+
 static bool query_status(
     runtime_snapshot_t *snap
 )
@@ -3001,6 +3208,17 @@ static esp_err_t execute_action(
     case DT_UI_ACTION_FILAMENT_UNLOAD:
         return execute_filament_macro(false);
 
+    case DT_UI_ACTION_SYSTEM_REBOOT:
+        ESP_LOGW(
+            TAG,
+            "reboot requested from UI"
+        );
+        vTaskDelay(
+            pdMS_TO_TICKS(100)
+        );
+        esp_restart();
+        return ESP_OK;
+
     default:
         return ESP_ERR_NOT_SUPPORTED;
     }
@@ -3143,6 +3361,11 @@ static void runtime_task(void *arg)
     TickType_t last_afc_status =
         xTaskGetTickCount() -
         pdMS_TO_TICKS(DT_AFC_STATUS_PERIOD_MS);
+
+    push_system_ui();
+
+    TickType_t last_system_update =
+        xTaskGetTickCount();
 
     for (;;) {
         dt_runtime_filament_request_t filament_request;
@@ -3338,6 +3561,19 @@ static void runtime_task(void *arg)
                     );
                 }
             }
+        }
+
+        const TickType_t system_now =
+            xTaskGetTickCount();
+
+        if (
+            system_now - last_system_update >=
+            pdMS_TO_TICKS(DT_SYSTEM_PERIOD_MS)
+        ) {
+            last_system_update =
+                system_now;
+
+            push_system_ui();
         }
 
         vTaskDelay(pdMS_TO_TICKS(20));
