@@ -9,12 +9,17 @@
 #
 # NOTE: component REQUIRES are expanded before Kconfig is available, so this mode is a
 # CMake variable (keyed off IDF_TARGET), not a CONFIG_ option.
-if(NOT DEFINED DT_HEADLESS_CONSOLE)
-    if(IDF_TARGET STREQUAL "esp32s3")
-        set(DT_HEADLESS_CONSOLE 0)
-    else()
-        set(DT_HEADLESS_CONSOLE 1)
-    endif()
+# Headless console vs. S3 panel. This must be decided from values visible during IDF's
+# early component-requirement expansion, where only IDF_TARGET and the environment are
+# available — NOT -D cache vars or CONFIG_ options (they'd desync REQUIRES from the
+# compile define below). So: an env override first, else default by target (on for any
+# non-S3 board, off on the S3 product). Force with `DT_HEADLESS_CONSOLE=1 idf.py build`.
+if(DEFINED ENV{DT_HEADLESS_CONSOLE})
+    set(DT_HEADLESS_CONSOLE $ENV{DT_HEADLESS_CONSOLE})
+elseif(IDF_TARGET STREQUAL "esp32s3")
+    set(DT_HEADLESS_CONSOLE 0)
+else()
+    set(DT_HEADLESS_CONSOLE 1)
 endif()
 
 if(DT_HEADLESS_CONSOLE)
