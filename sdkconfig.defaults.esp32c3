@@ -3,6 +3,11 @@
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_SPIRAM=n
 
+# Two-OTA partition table so the portal's OTA route actually has a target slot, and
+# each app slot (~1.9 MB) has ample headroom over the ~1 MB networking build.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_headless.csv"
+
 # The super-mini exposes the native USB-Serial-JTAG; route the console there so
 # `idf.py monitor` over /dev/ttyACM* shows logs (incl. the discovered-device dump).
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

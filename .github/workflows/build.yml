@@ -14,15 +14,37 @@ concurrency:
 jobs:
   esp-idf:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The S3 product build (default groundwork, no networking).
+          - name: S3 panel groundwork
+            target: esp32s3
+            headless: "0"
+          # The headless console as it ships on the C3 bench board.
+          - name: C3 headless console
+            target: esp32c3
+            headless: "1"
+          # The console forced onto the S3 target — proves the stack stays portable
+          # to the product chip.
+          - name: S3 headless console
+            target: esp32s3
+            headless: "1"
+    name: ${{ matrix.name }}
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Build ESP32-S3 scaffold (ESP-IDF v5.3)
+      # A too-large app overflows its partition and fails the build here, so this is
+      # also the size gate.
+      - name: Build (${{ matrix.name }})
         uses: espressif/esp-idf-ci-action@9d38657f3d789ca759b2b37aaf5ceffbc42c4f0d # v1
+        env:
+          DT_HEADLESS_CONSOLE: ${{ matrix.headless }}
         with:
           esp_idf_version: v5.3
-          target: esp32s3
+          target: ${{ matrix.target }}
           path: .
 
       - name: Reject whitespace errors
