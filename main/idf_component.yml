@@ -1,2 +1,16 @@
 dependencies:
   idf: ">=5.3"
+  # dragon-core networking + discovery (used by the ESP32-C3 headless console build).
+  # Pinned to the ESP-NOW peer-plane branch during development; re-pin to a tag on merge.
+  dc_wifi:
+    git: https://github.com/justinh-rahb/dragon-core.git
+    path: components/dc_wifi
+    version: feat/dc-peer-espnow
+  dc_peer:
+    git: https://github.com/justinh-rahb/dragon-core.git
+    path: components/dc_peer
+    version: feat/dc-peer-espnow
+  dc_registry:
+    git: https://github.com/justinh-rahb/dragon-core.git
+    path: components/dc_registry
+    version: feat/dc-peer-espnow
