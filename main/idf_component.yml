@@ -14,3 +14,17 @@ dependencies:
     git: https://github.com/justinh-rahb/dragon-core.git
     path: components/dc_registry
     version: feat/dc-peer-espnow
+  # Web server: setup SPA, Wi-Fi provisioning, OTA. The console registers its
+  # device-list routes into this server (dt_console_get_routes).
+  dc_portal:
+    git: https://github.com/justinh-rahb/dragon-core.git
+    path: components/dc_portal
+    version: feat/dc-peer-espnow
+  dc_ui:
+    git: https://github.com/justinh-rahb/dragon-core.git
+    path: components/dc_ui
+    version: feat/dc-peer-espnow
+  dc_evlog:
+    git: https://github.com/justinh-rahb/dragon-core.git
+    path: components/dc_evlog
+    version: feat/dc-peer-espnow

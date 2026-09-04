@@ -12,6 +12,7 @@
 #include "dc_wifi.h"
 #include "dc_peer.h"
 #include "dc_registry.h"
+#include "dc_portal.h"
 #include "dt_console.h"
 #else
 // S3 panel groundwork (unchanged): identify the board, do not touch the display yet.
@@ -52,8 +53,22 @@ static void headless_console_main(void)
     if (pe != ESP_OK) ESP_LOGW(TAG, "dc_peer_start: %s (continuing)", esp_err_to_name(pe));
 
     ESP_ERROR_CHECK(dc_registry_start());
-    ESP_ERROR_CHECK(dt_console_start());
-    ESP_LOGI(TAG, "console up as '%s' — discovering family devices", self_id);
+
+    // dc_portal owns the HTTP server (port 80): the setup SPA at "/", Wi-Fi
+    // provisioning, and OTA. The device-list routes (/devices, /api/devices) are
+    // registered as product routes so the emulated screen shares that one server.
+    const httpd_uri_t *routes = NULL;
+    size_t route_count = 0;
+    dt_console_get_routes(&routes, &route_count);
+    const dc_portal_config_t portal = {
+        .product = "dragontouch",
+        .display_name = "DragonTouch",
+        .product_routes = routes,
+        .product_route_count = route_count,
+    };
+    ESP_ERROR_CHECK(dc_portal_start(&portal));
+    ESP_ERROR_CHECK(dt_console_start_logger());
+    ESP_LOGI(TAG, "console up as '%s' — setup at /, devices at /devices", self_id);
 }
 #else
 static void groundwork_main(void)

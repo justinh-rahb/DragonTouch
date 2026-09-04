@@ -147,11 +147,23 @@ static const char PAGE[] =
 "tick();setInterval(tick,2000);"
 "</script>";
 
-static esp_err_t root_get(httpd_req_t *req)
+static esp_err_t devices_page_get(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, PAGE, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
+}
+
+// Routes handed to dc_portal (which owns the server, the setup SPA at "/", and OTA).
+static const httpd_uri_t s_routes[] = {
+    { .uri = "/devices",     .method = HTTP_GET, .handler = devices_page_get },
+    { .uri = "/api/devices", .method = HTTP_GET, .handler = devices_get },
+};
+
+void dt_console_get_routes(const httpd_uri_t **routes, size_t *count)
+{
+    if (routes) *routes = s_routes;
+    if (count)  *count = sizeof(s_routes) / sizeof(s_routes[0]);
 }
 
 // ---- periodic console dump (works even with no browser) ----
@@ -174,21 +186,10 @@ static void log_task(void *arg)
     }
 }
 
-esp_err_t dt_console_start(void)
+esp_err_t dt_console_start_logger(void)
 {
-    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.lru_purge_enable = true;
-    httpd_handle_t srv = NULL;
-    esp_err_t err = httpd_start(&srv, &cfg);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "httpd_start: %s", esp_err_to_name(err)); return err; }
-
-    httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_get };
-    httpd_uri_t devs = { .uri = "/api/devices", .method = HTTP_GET, .handler = devices_get };
-    httpd_register_uri_handler(srv, &root);
-    httpd_register_uri_handler(srv, &devs);
-
     if (xTaskCreate(log_task, "dt_console", 4096, NULL, 3, NULL) != pdPASS)
         return ESP_ERR_NO_MEM;
-    ESP_LOGI(TAG, "emulated screen up: http://<ip>/  (+ /api/devices)");
+    ESP_LOGI(TAG, "emulated screen at /devices  (JSON: /api/devices; setup: /setup)");
     return ESP_OK;
 }
