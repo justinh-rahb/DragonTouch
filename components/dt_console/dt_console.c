@@ -134,15 +134,19 @@ static const char PAGE[] =
 "<header><b>DragonTouch</b><span style=color:#888>family devices · status only</span></header>"
 "<div id=list></div><div id=empty>Scanning for Dragon devices…</div>"
 "<script>"
+// Device fields (id, name, firmware) come from unauthenticated ESP-NOW frames, so
+// escape every interpolated value before it reaches innerHTML — a nearby transmitter
+// must not be able to inject markup into this page.
+"const esc=s=>String(s==null?'':s).replace(/[&<>\"']/g,c=>'&#'+c.charCodeAt(0)+';');"
 "async function tick(){"
 "try{const r=await fetch('/api/devices');const d=await r.json();"
 "const L=document.getElementById('list'),E=document.getElementById('empty');"
 "if(!d.devices.length){E.style.display='';L.innerHTML='';return}E.style.display='none';"
 "L.innerHTML=d.devices.map(v=>`<div class='card ${v.online?'':'off'}'>`+"
-"`<div class=row><span class=name><span class=dot></span>${v.name||v.id}</span>`+"
-"`<span class=kind>${v.kind}</span></div>`+"
-"`<div class=sub>${v.id} · ${v.ip} · fw ${v.firmware||'?'} · ${(v.last_seen_ms_ago/1000).toFixed(1)}s ago</div>`+"
-"`<div class=status>${v.status}</div></div>`).join('')}"
+"`<div class=row><span class=name><span class=dot></span>${esc(v.name||v.id)}</span>`+"
+"`<span class=kind>${esc(v.kind)}</span></div>`+"
+"`<div class=sub>${esc(v.id)} · ${esc(v.ip)} · fw ${esc(v.firmware||'?')} · ${(v.last_seen_ms_ago/1000).toFixed(1)}s ago</div>`+"
+"`<div class=status>${esc(v.status)}</div></div>`).join('')}"
 "catch(e){}}"
 "tick();setInterval(tick,2000);"
 "</script>";
