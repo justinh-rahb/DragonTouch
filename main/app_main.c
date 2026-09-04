@@ -3,10 +3,15 @@
 
 #include "esp_log.h"
 
-#if CONFIG_IDF_TARGET_ESP32C3
-// Headless console bring-up board (ESP32-C3 super-mini, no panel). Brings up the
+#ifndef DT_HEADLESS_CONSOLE
+#define DT_HEADLESS_CONSOLE 0
+#endif
+
+#if DT_HEADLESS_CONSOLE
+// Headless console mode (no panel; we test it on an ESP32-C3 board). Brings up the
 // dragon-core networking + discovery stack and an "emulated screen" (dt_console),
-// proving family discovery + status end to end without the display driver.
+// proving family discovery + status end to end without the display driver. This is
+// the product's networking/UI core; on the S3 it will run alongside the panel.
 #include "nvs_flash.h"
 #include "esp_mac.h"
 #include "dc_wifi.h"
@@ -25,10 +30,10 @@
 
 static const char *TAG = "dragon_touch";
 
-#if CONFIG_IDF_TARGET_ESP32C3
+#if DT_HEADLESS_CONSOLE
 static void headless_console_main(void)
 {
-    ESP_LOGI(TAG, "DragonTouch headless console (C3 bring-up board)");
+    ESP_LOGI(TAG, "DragonTouch headless console mode (no panel)");
 
     esp_err_t nv = nvs_flash_init();
     if (nv == ESP_ERR_NVS_NO_FREE_PAGES || nv == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -93,7 +98,7 @@ static void groundwork_main(void)
 
 void app_main(void)
 {
-#if CONFIG_IDF_TARGET_ESP32C3
+#if DT_HEADLESS_CONSOLE
     headless_console_main();
 #else
     groundwork_main();
