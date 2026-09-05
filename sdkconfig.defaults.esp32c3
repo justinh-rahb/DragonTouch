@@ -1,0 +1,17 @@
+# Headless console bring-up board (ESP32-C3 super-mini): no panel, no PSRAM.
+# Overrides the S3/PSRAM assumptions in sdkconfig.defaults for this target.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_SPIRAM=n
+
+# Two-OTA partition table so the portal's OTA route actually has a target slot, and
+# each app slot (~1.9 MB) has ample headroom over the ~1 MB networking build.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_headless.csv"
+
+# The super-mini exposes the native USB-Serial-JTAG; route the console there so
+# `idf.py monitor` over /dev/ttyACM* shows logs (incl. the discovered-device dump).
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# ESP-NOW + Wi-Fi share the radio; keep the modem awake so broadcast frames aren't
+# missed under power save (matches the other Dragon devices' constrained profile).
+CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=n
