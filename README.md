@@ -59,4 +59,4 @@ reference. DragonTouch does not copy its implementation. See
 
 ## License
 
-License selection is intentionally deferred until the project owners choose one.
+[MIT](LICENSE) © Justin Hayes
