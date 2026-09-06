@@ -1,4 +1,5 @@
 #include "dt_portal.h"
+#include "dt_printers.h"
 
 #include <ctype.h>
 #include <stdbool.h>
@@ -392,6 +393,17 @@ static esp_err_t printer_post(httpd_req_t *req)
     cJSON_Delete(root);
 
     err = dc_moonraker_set_config(&cfg);
+
+    /*
+     * DT_PRINTER_LIST
+     *
+     * Anything configured through the portal also joins the on-screen
+     * picker, so pointing the portal at a second printer once is enough to
+     * make it switchable from the header thereafter.
+     */
+    if (err == ESP_OK) {
+        (void)dt_printers_add(cfg.host, cfg.port, cfg.api_key);
+    }
 
     if (err != ESP_OK) {
         ESP_LOGE(

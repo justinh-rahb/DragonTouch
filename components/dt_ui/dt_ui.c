@@ -2,11 +2,32 @@
 
 #include <stdio.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
-#include "esp_timer.h"
+
+#include "dt_printer_profile.h"
+
+/*
+ * DT_FILE_THUMBNAIL_CACHE_DROP
+ *
+ * lv_image_cache_drop() -- needed below so we don't serve a stale decoded
+ * image out of LVGL's image cache when re-using the same lv_image_dsc_t
+ * for a new file's PNG bytes (see the call site for why).
+ */
+#include "misc/cache/instance/lv_image_cache.h"
+
+/*
+ * DT_FILE_THUMBNAIL_DECODE_DIAG
+ *
+ * lv_image_decoder_dsc_t is only forward-declared (opaque) in the public
+ * LVGL headers (misc/lv_types.h) -- its real struct body lives here.
+ * webcam_decode_to_rgb() needs the complete type: it puts one on the
+ * stack and reads dsc.decoded while walking the JPEG's MCU blocks.
+ */
+#include "draw/lv_image_decoder_private.h"
 
 #ifndef DT_UI_HOST_PREVIEW
 #include "freertos/FreeRTOS.h"
@@ -25,6 +46,38 @@
 
 #define DT_PAGE_COUNT (DT_UI_PAGE_SETTINGS + 1)
 #define DT_CONTROL_TAB_COUNT 4
+
+/*
+ * DT_MOVE_STEP
+ *
+ * Jog/extrude distances and extrude speeds, chosen on screen. Whole
+ * millimetres so the gcode never needs float formatting.
+ */
+#define DT_MOVE_STEP_COUNT 4
+#define DT_EXTRUDE_SPEED_COUNT 2
+
+/*
+ * DT_WEBCAM_PRESCALE
+ *
+ * One pre-scaled copy of the current frame per view, sized to that view's
+ * pane so LVGL can blit it 1:1.
+ *
+ * The alternative -- LV_IMAGE_ALIGN_CONTAIN over the native 640x480 RGB888
+ * frame -- makes LVGL software-rescale the whole image on EVERY redraw that
+ * touches the pane, while holding the LVGL lock. A status label changing was
+ * enough to starve the periodic model pushes ("LVGL lock timeout; skipping
+ * ... update"). Scaling once per frame moves that cost off the draw path.
+ *
+ * The two panes are different sizes, so they cannot share one buffer.
+ */
+typedef struct {
+    uint8_t *data;
+    size_t capacity;
+    lv_image_dsc_t dsc;
+    uint32_t width;
+    uint32_t height;
+    uint32_t revision;
+} dt_webcam_view_t;
 #define DT_FILES_TAB_COUNT 3
 
 typedef enum {
@@ -33,6 +86,10 @@ typedef enum {
     DT_NAV_ICON_FILES,
     DT_NAV_ICON_FILAMENT,
     DT_NAV_ICON_DEVICES,
+
+    /* DT_WEBCAM_SNAPSHOT */
+    DT_NAV_ICON_WEBCAM,
+
     DT_NAV_ICON_SETTINGS,
 } dt_nav_icon_t;
 
@@ -48,12 +105,15 @@ typedef struct {
     lv_obj_t *filename;
     lv_obj_t *progress;
     lv_obj_t *progress_text;
-    lv_obj_t *time_text;
+    lv_obj_t *elapsed_text;
+    lv_obj_t *remaining_text;
+    lv_obj_t *estop_button;
     lv_obj_t *nozzle_text;
     lv_obj_t *bed_text;
-    lv_obj_t *fan_text;
-    lv_obj_t *printer_name;
-    lv_obj_t *printer_hint;
+    lv_obj_t *chamber_text;
+
+    /* DT_WEBCAM_HOME_PANE: second view of the same decoded frame */
+    lv_obj_t *home_webcam_image;
     lv_obj_t *pause_button;
     lv_obj_t *pause_label;
     lv_obj_t *cancel_button;
@@ -69,8 +129,47 @@ typedef struct {
 
     lv_obj_t *home_button;
     lv_obj_t *heat_button;
+
+    /* DT_TOAST */
+    lv_obj_t *toast_panel;
+    lv_obj_t *toast_label;
+    lv_timer_t *toast_timer;
+
+    /* DT_PRINTER_LIST */
+    lv_obj_t *printer_scrim;
+    lv_obj_t *printer_list;
+    lv_obj_t *printer_add_button;
+    lv_obj_t *printer_rows[DT_UI_PRINTER_MAX];
+    lv_obj_t *printer_entry_buttons[DT_UI_PRINTER_MAX];
+    lv_obj_t *printer_delete_buttons[DT_UI_PRINTER_MAX];
+    lv_obj_t *host_scrim;
+    lv_obj_t *host_textarea;
+    lv_obj_t *port_textarea;
+    lv_obj_t *api_key_textarea;
+    lv_obj_t *host_keyboard;
+    dt_ui_printer_model_t printer_model;
+
+    /* DT_MOVE_STEP */
+    lv_obj_t *z_tilt_button;
+    lv_obj_t *move_step_boxes[DT_MOVE_STEP_COUNT];
+    lv_obj_t *extrude_step_boxes[DT_MOVE_STEP_COUNT];
+    lv_obj_t *extrude_speed_boxes[DT_EXTRUDE_SPEED_COUNT];
+
+    /* DT_TEMP_ENTRY */
+    lv_obj_t *nozzle_set_button;
+    lv_obj_t *nozzle_cooldown_button;
+    lv_obj_t *bed_set_button;
+    lv_obj_t *bed_cooldown_button;
+    lv_obj_t *keypad_scrim;
+    lv_obj_t *keypad_title;
+    lv_obj_t *keypad_value;
     lv_obj_t *extrude_button;
     lv_obj_t *retract_button;
+
+    /* Home-page quick-access macros; see dt_printer_profile.h */
+    lv_obj_t *quick_home_button;
+    lv_obj_t *quick_clean_nozzle_button;
+    lv_obj_t *quick_macro2_button;
 
     lv_obj_t *jog_buttons[6];
     lv_obj_t *bed_buttons[3];
@@ -80,6 +179,29 @@ typedef struct {
     lv_obj_t *nozzle_control_text;
     lv_obj_t *bed_control_text;
     lv_obj_t *fan_control_text;
+
+    /* DT_DYNAMIC_AUX_FANS */
+    lv_obj_t *aux_fan_cards[DT_UI_AUX_FAN_MAX];
+    lv_obj_t *aux_fan_title[DT_UI_AUX_FAN_MAX];
+    lv_obj_t *aux_fan_status[DT_UI_AUX_FAN_MAX];
+    lv_obj_t *aux_fan_rows[DT_UI_AUX_FAN_MAX];
+    lv_obj_t *aux_fan_buttons
+        [DT_UI_AUX_FAN_MAX]
+        [DT_UI_AUX_FAN_PRESET_COUNT];
+
+    /*
+     * DT_DYNAMIC_AUX_FANS_DIRECT_ROWS
+     *
+     * Up to four manual fan_generic rows are rendered inside one shallow card.
+     */
+    lv_obj_t *aux_manual_rows[4];
+    lv_obj_t *aux_manual_labels[4];
+    /* DT_DYNAMIC_AUX_FAN_SLIDERS */
+    lv_obj_t *aux_manual_sliders[4];
+    char aux_manual_names[4][64];
+    bool aux_manual_dragging[4];
+    size_t aux_manual_slots[4];
+    size_t aux_manual_count;
 
     /* DT_STAGE4_FILES */
     dt_ui_files_model_t files_model;
@@ -134,7 +256,28 @@ typedef struct {
     lv_obj_t *file_next_button;
     lv_obj_t *file_detail_text;
     lv_obj_t *file_start_button;
+
+    /* DT_FILE_THUMBNAIL_PREVIEW */
+    lv_obj_t *file_thumbnail_row;
+    lv_obj_t *file_thumbnail_image;
+    lv_image_dsc_t file_thumbnail_dsc;
+
     char file_confirm_body[320];
+
+    /* DT_WEBCAM_SNAPSHOT */
+    lv_obj_t *webcam_status_text;
+    lv_obj_t *webcam_image_wrap;
+    lv_obj_t *webcam_image;
+    lv_image_dsc_t webcam_dsc;     /* encoded JPEG: decoder input */
+    lv_image_dsc_t webcam_rgb_dsc; /* decoded frame: what the widget draws */
+    uint8_t *webcam_rgb_data;
+    uint32_t webcam_decoded_revision;
+    size_t webcam_rgb_capacity;
+
+    /* DT_WEBCAM_PRESCALE */
+    dt_webcam_view_t webcam_view_page;
+    dt_webcam_view_t webcam_view_home;
+    dt_ui_webcam_model_t webcam_model;
 
     dt_ui_connection_t current_connection;
 
@@ -172,8 +315,37 @@ static void *s_action_ctx;
 static dt_ui_file_request_handler_t s_file_request_handler;
 static void *s_file_request_ctx;
 static dt_ui_filament_request_handler_t s_filament_request_handler;
+
+/* DT_TEMP_ENTRY */
+static dt_ui_temperature_request_handler_t s_temperature_request_handler;
+static void *s_temperature_request_ctx;
+
+/* DT_MOVE_STEP */
+static dt_ui_move_request_handler_t s_move_request_handler;
+static void *s_move_request_ctx;
+
+/* DT_PRINTER_LIST */
+static dt_ui_printer_request_handler_t s_printer_request_handler;
+static void *s_printer_request_ctx;
+static int s_pending_printer_index = -1;
+static dt_ui_printer_request_t s_pending_printer_request;
+static char s_printer_confirm_body[192];
+
+static const int DT_MOVE_STEPS[DT_MOVE_STEP_COUNT] = {1, 10, 25, 50};
+static const int DT_EXTRUDE_SPEEDS[DT_EXTRUDE_SPEED_COUNT] = {2, 10};
+
+static int s_move_step_mm = 10;
+static int s_extrude_step_mm = 10;
+static int s_extrude_speed_mms = 2;
 static void *s_filament_request_ctx;
 static bool s_pending_filament_request_valid;
+
+/* DT_MOVE_STEP */
+static bool s_pending_move_request_valid;
+static dt_ui_move_axis_t s_pending_move_axis;
+static int s_pending_move_delta;
+static int s_pending_move_speed;
+static char s_extrude_confirm_body[192];
 static dt_ui_filament_request_t s_pending_filament_request;
 static int s_pending_filament_lane;
 static dt_ui_action_t s_pending_action;
@@ -290,6 +462,11 @@ static void nav_icon_draw(lv_event_t *event)
         draw_icon_line(layer, line_color, x, y, 18, 16, 20, 16);
         draw_icon_circle(layer, line_color, x, y, 15, 16, 3);
         break;
+    case DT_NAV_ICON_WEBCAM:
+        draw_icon_rect(layer, line_color, x, y, 2, 7, 20, 18);
+        draw_icon_rect(layer, line_color, x, y, 8, 3, 14, 7);
+        draw_icon_circle(layer, line_color, x, y, 11, 13, 4);
+        break;
     }
 }
 
@@ -400,6 +577,7 @@ static void set_button_enabled(lv_obj_t *button, bool enabled)
 
 static void ensure_page_built(dt_ui_page_t page);
 static void recycle_secondary_pages(dt_ui_page_t keep);
+static void dispatch_action(dt_ui_action_t action);
 
 static void show_page(dt_ui_page_t selected)
 {
@@ -473,6 +651,20 @@ static void show_page(dt_ui_page_t selected)
             0
         );
     }
+
+    /*
+     * DT_WEBCAM_AUTOLOAD
+     *
+     * Opening the webcam page pulls a frame straight away, so it is never
+     * shown empty. This only queues the request -- the runtime task does
+     * the fetch, exactly as it does for a tap on the image.
+     */
+    if (
+        selected == DT_UI_PAGE_WEBCAM ||
+        selected == DT_UI_PAGE_HOME
+    ) {
+        dispatch_action(DT_UI_ACTION_WEBCAM_REFRESH);
+    }
 }
 
 static void nav_event(lv_event_t *event)
@@ -506,6 +698,16 @@ static const dt_confirmation_t CONFIRM_HOME = {
     "Home all axes",
     false,
     DT_UI_ACTION_HOME_ALL,
+};
+
+/* DT_Z_TILT */
+static const dt_confirmation_t CONFIRM_Z_TILT = {
+    "Run Z tilt adjust?",
+    "The printer will execute Z_TILT_ADJUST and probe the bed. "
+    "Keep the motion envelope clear.",
+    "Run Z tilt",
+    false,
+    DT_UI_ACTION_Z_TILT,
 };
 
 static const dt_confirmation_t CONFIRM_HEAT = {
@@ -594,6 +796,592 @@ static void dispatch_filament_request(
 }
 
 
+/*
+ * DT_TEMP_ENTRY
+ *
+ * Nozzle and bed maxima mirror the printer's configured max_temp. Klipper
+ * would reject anything higher anyway; clamping here means the user sees a
+ * capped number rather than an error after the fact.
+ */
+static dt_ui_heater_t s_keypad_heater;
+static char s_keypad_digits[4];
+
+/*
+ * DT_MOVE_STEP
+ *
+ * lv_checkbox has no built-in radio behaviour, so exclusivity is enforced
+ * by hand: on any tap the whole group is re-stated from the stored value.
+ * That also re-checks the box if the user taps the one already selected,
+ * so a group is never left with nothing chosen.
+ */
+enum {
+    DT_STEP_GROUP_MOVE = 0,
+    DT_STEP_GROUP_EXTRUDE_STEP,
+    DT_STEP_GROUP_EXTRUDE_SPEED,
+};
+
+static void dispatch_move_request(
+    dt_ui_move_axis_t axis,
+    int delta_mm,
+    int speed_mms
+)
+{
+    if (s_move_request_handler != NULL) {
+        s_move_request_handler(
+            axis,
+            delta_mm,
+            speed_mms,
+            s_move_request_ctx
+        );
+    }
+}
+
+
+static void step_group_apply(int group)
+{
+    lv_obj_t *const *boxes;
+    const int *values;
+    size_t count;
+    int selected;
+
+    switch (group) {
+    case DT_STEP_GROUP_EXTRUDE_STEP:
+        boxes = s_ui.extrude_step_boxes;
+        values = DT_MOVE_STEPS;
+        count = DT_MOVE_STEP_COUNT;
+        selected = s_extrude_step_mm;
+        break;
+
+    case DT_STEP_GROUP_EXTRUDE_SPEED:
+        boxes = s_ui.extrude_speed_boxes;
+        values = DT_EXTRUDE_SPEEDS;
+        count = DT_EXTRUDE_SPEED_COUNT;
+        selected = s_extrude_speed_mms;
+        break;
+
+    default:
+        boxes = s_ui.move_step_boxes;
+        values = DT_MOVE_STEPS;
+        count = DT_MOVE_STEP_COUNT;
+        selected = s_move_step_mm;
+        break;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        if (boxes[i] == NULL) {
+            continue;
+        }
+
+        if (values[i] == selected) {
+            lv_obj_add_state(boxes[i], LV_STATE_CHECKED);
+        } else {
+            lv_obj_remove_state(boxes[i], LV_STATE_CHECKED);
+        }
+    }
+}
+
+
+static void step_select_event(lv_event_t *event)
+{
+    const uintptr_t packed =
+        (uintptr_t)lv_event_get_user_data(event);
+
+    const int group = (int)(packed >> 8);
+    const size_t index = (size_t)(packed & 0xFFU);
+
+    switch (group) {
+    case DT_STEP_GROUP_EXTRUDE_STEP:
+        s_extrude_step_mm = DT_MOVE_STEPS[index];
+        break;
+
+    case DT_STEP_GROUP_EXTRUDE_SPEED:
+        s_extrude_speed_mms = DT_EXTRUDE_SPEEDS[index];
+        break;
+
+    default:
+        s_move_step_mm = DT_MOVE_STEPS[index];
+        break;
+    }
+
+    step_group_apply(group);
+}
+
+
+static void create_step_group(
+    lv_obj_t *parent,
+    int group,
+    const int *values,
+    size_t count,
+    lv_obj_t **boxes,
+    const char *suffix
+)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LV_PCT(100), 30);
+    lv_obj_set_layout(row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(row, 14, 0);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    for (size_t i = 0; i < count; ++i) {
+        char label[16];
+
+        snprintf(
+            label,
+            sizeof(label),
+            "%d %s",
+            values[i],
+            suffix
+        );
+
+        boxes[i] = lv_checkbox_create(row);
+        lv_checkbox_set_text(boxes[i], label);
+
+        lv_obj_set_style_text_color(
+            boxes[i],
+            color(DT_COLOR_TEXT),
+            0
+        );
+
+        /*
+         * CLICKED, not VALUE_CHANGED: step_group_apply() sets the state
+         * programmatically and VALUE_CHANGED would feed back into here.
+         */
+        lv_obj_add_event_cb(
+            boxes[i],
+            step_select_event,
+            LV_EVENT_CLICKED,
+            (void *)(uintptr_t)(((unsigned)group << 8) | (unsigned)i)
+        );
+    }
+
+    step_group_apply(group);
+}
+
+
+static void jog_event(lv_event_t *event)
+{
+    const uintptr_t packed =
+        (uintptr_t)lv_event_get_user_data(event);
+
+    dispatch_move_request(
+        (dt_ui_move_axis_t)(packed >> 1),
+        (packed & 1U) ? s_move_step_mm : -s_move_step_mm,
+        0
+    );
+}
+
+
+/*
+ * DT_TOAST
+ *
+ * One-shot hide. The timer is created paused and simply reset on each new
+ * message, so a burst of commands keeps the panel up rather than flickering.
+ */
+static void toast_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+
+    if (s_ui.toast_panel != NULL) {
+        lv_obj_add_flag(
+            s_ui.toast_panel,
+            LV_OBJ_FLAG_HIDDEN
+        );
+    }
+
+    if (s_ui.toast_timer != NULL) {
+        lv_timer_pause(s_ui.toast_timer);
+    }
+}
+
+
+/*
+ * DT_PRINTER_LIST
+ *
+ * Switching instances restarts the device rather than rebinding in place.
+ * load_moonraker_config() runs once at runtime init and the capability
+ * discovery behind it is not re-entrant, so a restart is the only way to land
+ * in a known-good state today. It also matches dc_source_set(), which already
+ * defers a source change to the next boot.
+ */
+static void dispatch_printer_request(
+    dt_ui_printer_request_t request,
+    int index,
+    const char *host,
+    uint16_t port,
+    const char *api_key
+)
+{
+    if (s_printer_request_handler != NULL) {
+        s_printer_request_handler(
+            request,
+            index,
+            host,
+            port,
+            api_key,
+            s_printer_request_ctx
+        );
+    }
+}
+
+
+static void render_printer_model(void)
+{
+    const dt_ui_printer_model_t *model =
+        &s_ui.printer_model;
+
+    for (size_t i = 0; i < DT_UI_PRINTER_MAX; ++i) {
+        lv_obj_t *button =
+            s_ui.printer_entry_buttons[i];
+
+        lv_obj_t *row = s_ui.printer_rows[i];
+
+        if (button == NULL || row == NULL) {
+            continue;
+        }
+
+        if (i >= model->count) {
+            lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_HIDDEN);
+
+        lv_obj_t *label =
+            lv_obj_get_child(button, 0);
+
+        if (label != NULL) {
+            /* The live entry is marked rather than disabled -- re-selecting
+             * it is a legitimate way to force a clean restart. */
+            lv_label_set_text_fmt(
+                label,
+                "%s%s",
+                model->entries[i].host,
+                model->entries[i].active ? "   (active)" : ""
+            );
+        }
+
+        lv_obj_set_style_bg_color(
+            button,
+            color(
+                model->entries[i].active
+                    ? DT_COLOR_ACCENT
+                    : DT_COLOR_SURFACE_2
+            ),
+            0
+        );
+    }
+
+    if (s_ui.printer_add_button != NULL) {
+        set_button_enabled(
+            s_ui.printer_add_button,
+            !model->full
+        );
+    }
+}
+
+
+static void printer_close_event(lv_event_t *event)
+{
+    (void)event;
+
+    lv_obj_add_flag(
+        s_ui.printer_scrim,
+        LV_OBJ_FLAG_HIDDEN
+    );
+}
+
+
+static void printer_open_event(lv_event_t *event)
+{
+    (void)event;
+
+    if (s_ui.printer_scrim == NULL) {
+        return;
+    }
+
+    render_printer_model();
+
+    lv_obj_remove_flag(
+        s_ui.printer_scrim,
+        LV_OBJ_FLAG_HIDDEN
+    );
+
+    lv_obj_move_foreground(s_ui.printer_scrim);
+}
+
+
+static void host_close_event(lv_event_t *event)
+{
+    (void)event;
+
+    lv_obj_add_flag(
+        s_ui.host_scrim,
+        LV_OBJ_FLAG_HIDDEN
+    );
+}
+
+
+static void host_open_event(lv_event_t *event)
+{
+    (void)event;
+
+    if (s_ui.host_scrim == NULL) {
+        return;
+    }
+
+    lv_textarea_set_text(s_ui.host_textarea, "");
+    lv_textarea_set_text(s_ui.port_textarea, "");
+    lv_textarea_set_text(s_ui.api_key_textarea, "");
+
+    lv_obj_add_flag(
+        s_ui.printer_scrim,
+        LV_OBJ_FLAG_HIDDEN
+    );
+
+    lv_obj_remove_flag(
+        s_ui.host_scrim,
+        LV_OBJ_FLAG_HIDDEN
+    );
+
+    lv_obj_move_foreground(s_ui.host_scrim);
+}
+
+
+static void host_confirm_event(lv_event_t *event)
+{
+    (void)event;
+
+    const char *host =
+        lv_textarea_get_text(s_ui.host_textarea);
+
+    const char *port_text =
+        lv_textarea_get_text(s_ui.port_textarea);
+
+    const char *api_key =
+        lv_textarea_get_text(s_ui.api_key_textarea);
+
+    if (host != NULL && host[0] != '\0') {
+        /* Blank port means "the default", which dt_printers_add() fills in. */
+        int port =
+            (port_text != NULL && port_text[0] != '\0')
+                ? atoi(port_text)
+                : 0;
+
+        if (port < 0 || port > 65535) {
+            port = 0;
+        }
+
+        dispatch_printer_request(
+            DT_UI_PRINTER_REQUEST_ADD,
+            -1,
+            host,
+            (uint16_t)port,
+            api_key != NULL ? api_key : ""
+        );
+    }
+
+    lv_obj_add_flag(
+        s_ui.host_scrim,
+        LV_OBJ_FLAG_HIDDEN
+    );
+}
+
+
+/*
+ * DT_PRINTER_LIST
+ *
+ * The keyboard follows whichever field was last tapped, and switches to
+ * digits for the port so a hostname's letters cannot land in it.
+ *
+ * Bound to CLICKED, not FOCUSED: lv_textarea only reacts to focus events,
+ * it does not focus itself on touch, and there is no input group in this
+ * UI to generate them.
+ */
+static void host_field_focus_event(lv_event_t *event)
+{
+    lv_obj_t *target =
+        lv_event_get_target_obj(event);
+
+    if (s_ui.host_keyboard == NULL || target == NULL) {
+        return;
+    }
+
+    lv_keyboard_set_mode(
+        s_ui.host_keyboard,
+        target == s_ui.port_textarea
+            ? LV_KEYBOARD_MODE_NUMBER
+            : LV_KEYBOARD_MODE_TEXT_LOWER
+    );
+
+    lv_keyboard_set_textarea(s_ui.host_keyboard, target);
+}
+
+
+static void dispatch_temperature_request(
+    dt_ui_heater_t heater,
+    int celsius
+)
+{
+    if (s_temperature_request_handler != NULL) {
+        s_temperature_request_handler(
+            heater,
+            celsius,
+            s_temperature_request_ctx
+        );
+    }
+}
+
+
+static int keypad_limit(dt_ui_heater_t heater)
+{
+    return heater == DT_UI_HEATER_BED
+        ? DT_PROFILE_BED_MAX_C
+        : DT_PROFILE_NOZZLE_MAX_C;
+}
+
+
+static void keypad_refresh_value(void)
+{
+    if (s_ui.keypad_value == NULL) {
+        return;
+    }
+
+    lv_label_set_text_fmt(
+        s_ui.keypad_value,
+        "%s °C",
+        s_keypad_digits[0] != '\0'
+            ? s_keypad_digits
+            : "0"
+    );
+}
+
+
+static void keypad_close_event(lv_event_t *event)
+{
+    (void)event;
+
+    lv_obj_add_flag(
+        s_ui.keypad_scrim,
+        LV_OBJ_FLAG_HIDDEN
+    );
+}
+
+
+static void keypad_digit_event(lv_event_t *event)
+{
+    const char digit =
+        (char)(uintptr_t)lv_event_get_user_data(event);
+
+    const size_t length =
+        strlen(s_keypad_digits);
+
+    if (length + 1 >= sizeof(s_keypad_digits)) {
+        return;
+    }
+
+    /* No leading zeros -- "0" alone comes from Cooldown or an empty entry. */
+    if (length == 0 && digit == '0') {
+        return;
+    }
+
+    s_keypad_digits[length] = digit;
+    s_keypad_digits[length + 1] = '\0';
+
+    keypad_refresh_value();
+}
+
+
+static void keypad_clear_event(lv_event_t *event)
+{
+    (void)event;
+
+    s_keypad_digits[0] = '\0';
+    keypad_refresh_value();
+}
+
+
+static void keypad_delete_event(lv_event_t *event)
+{
+    (void)event;
+
+    const size_t length =
+        strlen(s_keypad_digits);
+
+    if (length > 0) {
+        s_keypad_digits[length - 1] = '\0';
+    }
+
+    keypad_refresh_value();
+}
+
+
+static void keypad_confirm_event(lv_event_t *event)
+{
+    (void)event;
+
+    int value = atoi(s_keypad_digits);
+    const int limit = keypad_limit(s_keypad_heater);
+
+    if (value < 0) {
+        value = 0;
+    }
+
+    if (value > limit) {
+        value = limit;
+    }
+
+    dispatch_temperature_request(
+        s_keypad_heater,
+        value
+    );
+
+    lv_obj_add_flag(
+        s_ui.keypad_scrim,
+        LV_OBJ_FLAG_HIDDEN
+    );
+}
+
+
+static void keypad_open_event(lv_event_t *event)
+{
+    s_keypad_heater =
+        (dt_ui_heater_t)(uintptr_t)
+        lv_event_get_user_data(event);
+
+    s_keypad_digits[0] = '\0';
+
+    if (s_ui.keypad_title != NULL) {
+        lv_label_set_text_fmt(
+            s_ui.keypad_title,
+            "%s target  (max %d °C)",
+            s_keypad_heater == DT_UI_HEATER_BED
+                ? "Bed"
+                : "Nozzle",
+            keypad_limit(s_keypad_heater)
+        );
+    }
+
+    keypad_refresh_value();
+
+    lv_obj_remove_flag(
+        s_ui.keypad_scrim,
+        LV_OBJ_FLAG_HIDDEN
+    );
+}
+
+
+static void cooldown_event(lv_event_t *event)
+{
+    dispatch_temperature_request(
+        (dt_ui_heater_t)(uintptr_t)
+        lv_event_get_user_data(event),
+        0
+    );
+}
+
+
 static void direct_action_event(lv_event_t *event)
 {
     dispatch_action(
@@ -649,7 +1437,27 @@ static void confirm_dialog_event(lv_event_t *event)
 {
     (void)event;
 
-    if (s_pending_filament_request_valid) {
+    if (s_pending_printer_index >= 0) {
+        /* DT_PRINTER_LIST */
+        dispatch_printer_request(
+            s_pending_printer_request,
+            s_pending_printer_index,
+            NULL,
+            0,
+            NULL
+        );
+
+        s_pending_printer_index = -1;
+    } else if (s_pending_move_request_valid) {
+        /* DT_MOVE_STEP */
+        dispatch_move_request(
+            s_pending_move_axis,
+            s_pending_move_delta,
+            s_pending_move_speed
+        );
+
+        s_pending_move_request_valid = false;
+    } else if (s_pending_filament_request_valid) {
         dispatch_filament_request(
             s_pending_filament_request,
             s_pending_filament_lane
@@ -672,6 +1480,8 @@ static void show_confirmation(
 )
 {
     s_pending_filament_request_valid = false;
+    s_pending_move_request_valid = false;
+    s_pending_printer_index = -1;
 
     s_pending_action =
         confirmation->action;
@@ -719,6 +1529,194 @@ static void show_confirmation(
 
     lv_obj_move_foreground(
         s_ui.dialog_scrim
+    );
+}
+
+
+/*
+ * DT_MOVE_STEP
+ *
+ * Same dialog, but the pending request carries a value rather than a bare
+ * action, so the body can name the distance and speed actually selected.
+ */
+static void show_move_confirmation(
+    dt_ui_move_axis_t axis,
+    int delta_mm,
+    int speed_mms,
+    const char *title,
+    const char *body,
+    const char *confirm_label
+)
+{
+    s_pending_move_request_valid = true;
+    s_pending_filament_request_valid = false;
+    s_pending_printer_index = -1;
+    s_pending_move_axis = axis;
+    s_pending_move_delta = delta_mm;
+    s_pending_move_speed = speed_mms;
+
+    lv_label_set_text(s_ui.dialog_title, title);
+    lv_label_set_text(s_ui.dialog_body, body);
+    lv_label_set_text(s_ui.dialog_confirm_label, confirm_label);
+
+    lv_obj_set_style_text_color(
+        s_ui.dialog_confirm_label,
+        color(DT_COLOR_TEXT),
+        0
+    );
+
+    set_button_enabled(
+        s_ui.dialog_confirm,
+        s_move_request_handler != NULL
+    );
+
+    lv_obj_remove_flag(
+        s_ui.dialog_scrim,
+        LV_OBJ_FLAG_HIDDEN
+    );
+
+    lv_obj_move_foreground(
+        s_ui.dialog_scrim
+    );
+}
+
+
+/*
+ * DT_PRINTER_LIST
+ *
+ * Routed through the same dialog as every other printer-owned command, but
+ * the pending slot holds a list index rather than an action.
+ */
+static void printer_select_event(lv_event_t *event)
+{
+    const int index =
+        (int)(intptr_t)lv_event_get_user_data(event);
+
+    if (
+        index < 0 ||
+        (size_t)index >= s_ui.printer_model.count
+    ) {
+        return;
+    }
+
+    lv_obj_add_flag(
+        s_ui.printer_scrim,
+        LV_OBJ_FLAG_HIDDEN
+    );
+
+    snprintf(
+        s_printer_confirm_body,
+        sizeof(s_printer_confirm_body),
+        "Switch to %s? Any print in progress is unaffected -- this only "
+        "changes which printer DragonTouch is watching.",
+        s_ui.printer_model.entries[index].host
+    );
+
+    s_pending_filament_request_valid = false;
+    s_pending_move_request_valid = false;
+    s_pending_printer_index = index;
+    s_pending_printer_request = DT_UI_PRINTER_REQUEST_SELECT;
+
+    lv_label_set_text(s_ui.dialog_title, "Switch printer?");
+    lv_label_set_text(s_ui.dialog_body, s_printer_confirm_body);
+    lv_label_set_text(s_ui.dialog_confirm_label, "Switch");
+
+    lv_obj_set_style_text_color(
+        s_ui.dialog_confirm_label,
+        color(DT_COLOR_TEXT),
+        0
+    );
+
+    set_button_enabled(
+        s_ui.dialog_confirm,
+        s_printer_request_handler != NULL
+    );
+
+    lv_obj_remove_flag(
+        s_ui.dialog_scrim,
+        LV_OBJ_FLAG_HIDDEN
+    );
+
+    lv_obj_move_foreground(s_ui.dialog_scrim);
+}
+
+
+static void printer_delete_event(lv_event_t *event)
+{
+    const int index =
+        (int)(intptr_t)lv_event_get_user_data(event);
+
+    if (
+        index < 0 ||
+        (size_t)index >= s_ui.printer_model.count
+    ) {
+        return;
+    }
+
+    lv_obj_add_flag(
+        s_ui.printer_scrim,
+        LV_OBJ_FLAG_HIDDEN
+    );
+
+    snprintf(
+        s_printer_confirm_body,
+        sizeof(s_printer_confirm_body),
+        "Forget %s? This only removes it from this list -- if it is the "
+        "printer currently in use, the connection is unaffected.",
+        s_ui.printer_model.entries[index].host
+    );
+
+    s_pending_filament_request_valid = false;
+    s_pending_move_request_valid = false;
+    s_pending_printer_index = index;
+    s_pending_printer_request = DT_UI_PRINTER_REQUEST_REMOVE;
+
+    lv_label_set_text(s_ui.dialog_title, "Forget printer?");
+    lv_label_set_text(s_ui.dialog_body, s_printer_confirm_body);
+    lv_label_set_text(s_ui.dialog_confirm_label, "Forget");
+
+    lv_obj_set_style_text_color(
+        s_ui.dialog_confirm_label,
+        color(DT_COLOR_TEXT),
+        0
+    );
+
+    set_button_enabled(
+        s_ui.dialog_confirm,
+        s_printer_request_handler != NULL
+    );
+
+    lv_obj_remove_flag(
+        s_ui.dialog_scrim,
+        LV_OBJ_FLAG_HIDDEN
+    );
+
+    lv_obj_move_foreground(s_ui.dialog_scrim);
+}
+
+
+static void extrude_event(lv_event_t *event)
+{
+    const bool forward =
+        (uintptr_t)lv_event_get_user_data(event) != 0U;
+
+    snprintf(
+        s_extrude_confirm_body,
+        sizeof(s_extrude_confirm_body),
+        "The printer will %s %d mm of filament at %d mm/s. "
+        "The hotend must be at temperature.",
+        forward ? "extrude" : "retract",
+        s_extrude_step_mm,
+        s_extrude_speed_mms
+    );
+
+    show_move_confirmation(
+        DT_UI_MOVE_AXIS_E,
+        forward ? s_extrude_step_mm : -s_extrude_step_mm,
+        s_extrude_speed_mms,
+        forward ? "Extrude filament?" : "Retract filament?",
+        s_extrude_confirm_body,
+        forward ? "Extrude" : "Retract"
     );
 }
 
@@ -786,16 +1784,53 @@ static lv_obj_t *make_page(lv_obj_t *parent)
     return page;
 }
 
-static void create_metric(lv_obj_t *parent, const char *name, lv_obj_t **value)
+/*
+ * DT_TEMP_GRID
+ *
+ * One column of the temperatures tile: sensor name above its reading, both
+ * centered. Three of these side by side give the two-row, three-column
+ * layout.
+ */
+static void create_temp_cell(
+    lv_obj_t *parent,
+    const char *name,
+    lv_obj_t **value
+)
 {
-    lv_obj_t *row = lv_obj_create(parent);
-    lv_obj_remove_style_all(row);
-    lv_obj_set_width(row, LV_PCT(100));
-    lv_obj_set_height(row, 26);
-    make_label(row, name, DT_COLOR_MUTED);
-    *value = make_label(row, "--", DT_COLOR_TEXT);
-    lv_obj_align(*value, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_t *cell = lv_obj_create(parent);
+    lv_obj_remove_style_all(cell);
+    lv_obj_set_height(cell, LV_PCT(100));
+    lv_obj_set_flex_grow(cell, 1);
+    lv_obj_set_layout(cell, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(cell, LV_FLEX_FLOW_COLUMN);
+
+    lv_obj_set_flex_align(
+        cell,
+        LV_FLEX_ALIGN_CENTER,
+        LV_FLEX_ALIGN_CENTER,
+        LV_FLEX_ALIGN_CENTER
+    );
+
+    lv_obj_set_style_pad_row(cell, 4, 0);
+
+    lv_obj_t *label =
+        make_label(cell, name, DT_COLOR_MUTED);
+
+    lv_obj_set_style_text_align(
+        label,
+        LV_TEXT_ALIGN_CENTER,
+        0
+    );
+
+    *value = make_label(cell, "--", DT_COLOR_TEXT);
+
+    lv_obj_set_style_text_align(
+        *value,
+        LV_TEXT_ALIGN_CENTER,
+        0
+    );
 }
+
 
 static void create_home_page(lv_obj_t *page)
 {
@@ -813,18 +1848,60 @@ static void create_home_page(lv_obj_t *page)
     lv_obj_t *job = make_card(main_column, "CURRENT JOB");
     lv_obj_set_width(job, LV_PCT(100));
     lv_obj_set_flex_grow(job, 1);
-    s_ui.job_state = make_label(job, "Printer unavailable", DT_COLOR_TEXT);
+    lv_obj_remove_flag(job, LV_OBJ_FLAG_SCROLLABLE);
+
+    /*
+     * DT_JOB_TWO_COLUMN
+     *
+     * Job details on the left, elapsed/remaining stacked on the right.
+     * Splitting the old single time line off into its own column is what
+     * lets the card fit its slot without scrolling. The action row stays
+     * below, spanning both columns.
+     */
+    lv_obj_t *job_row = lv_obj_create(job);
+    lv_obj_remove_style_all(job_row);
+    lv_obj_set_width(job_row, LV_PCT(100));
+    lv_obj_set_flex_grow(job_row, 1);
+    lv_obj_set_layout(job_row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(job_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(job_row, 12, 0);
+    lv_obj_remove_flag(job_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *job_details = lv_obj_create(job_row);
+    lv_obj_remove_style_all(job_details);
+    lv_obj_set_height(job_details, LV_PCT(100));
+    lv_obj_set_flex_grow(job_details, 1);
+    lv_obj_set_layout(job_details, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(job_details, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(job_details, 6, 0);
+    lv_obj_remove_flag(job_details, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_ui.job_state = make_label(job_details, "Printer unavailable", DT_COLOR_TEXT);
     lv_obj_set_style_text_font(s_ui.job_state, &lv_font_montserrat_20, 0);
-    s_ui.filename = make_label(job, "No active file", DT_COLOR_MUTED);
+    s_ui.filename = make_label(job_details, "No active file", DT_COLOR_MUTED);
     lv_label_set_long_mode(s_ui.filename, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_width(s_ui.filename, LV_PCT(100));
-    s_ui.progress = lv_bar_create(job);
+    s_ui.progress = lv_bar_create(job_details);
     lv_obj_set_size(s_ui.progress, LV_PCT(100), 10);
     lv_bar_set_range(s_ui.progress, 0, 100);
     lv_obj_set_style_bg_color(s_ui.progress, color(DT_COLOR_SURFACE_2), LV_PART_MAIN);
     lv_obj_set_style_bg_color(s_ui.progress, color(DT_COLOR_ACCENT), LV_PART_INDICATOR);
-    s_ui.progress_text = make_label(job, "0%", DT_COLOR_TEXT);
-    s_ui.time_text = make_label(job, "Elapsed --  •  Remaining --", DT_COLOR_MUTED);
+    s_ui.progress_text = make_label(job_details, "0%", DT_COLOR_TEXT);
+
+    lv_obj_t *job_times = lv_obj_create(job_row);
+    lv_obj_remove_style_all(job_times);
+    lv_obj_set_width(job_times, 150);
+    lv_obj_set_height(job_times, LV_PCT(100));
+    lv_obj_set_layout(job_times, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(job_times, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(job_times, 6, 0);
+    lv_obj_remove_flag(job_times, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_ui.elapsed_text =
+        make_label(job_times, "Elapsed --", DT_COLOR_MUTED);
+
+    s_ui.remaining_text =
+        make_label(job_times, "Remaining --", DT_COLOR_MUTED);
 
     lv_obj_t *actions = lv_obj_create(job);
     lv_obj_remove_style_all(actions);
@@ -854,6 +1931,31 @@ static void create_home_page(lv_obj_t *page)
     set_button_enabled(s_ui.pause_button, false);
     set_button_enabled(s_ui.cancel_button, false);
 
+    /*
+     * DT_TEMP_GRID
+     *
+     * Two rows, three columns: names on top, readings beneath. Part fan
+     * moved out -- it isn't a temperature, and the fan page still shows
+     * it. Chamber ([temperature_sensor chamber]) takes its place.
+     */
+    lv_obj_t *temperatures =
+        make_card(main_column, "TEMPERATURES");
+
+    lv_obj_set_width(temperatures, LV_PCT(100));
+    lv_obj_set_height(temperatures, 96);
+
+    lv_obj_t *temp_row = lv_obj_create(temperatures);
+    lv_obj_remove_style_all(temp_row);
+    lv_obj_set_width(temp_row, LV_PCT(100));
+    lv_obj_set_flex_grow(temp_row, 1);
+    lv_obj_set_layout(temp_row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(temp_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(temp_row, 8, 0);
+
+    create_temp_cell(temp_row, "Nozzle", &s_ui.nozzle_text);
+    create_temp_cell(temp_row, "Bed", &s_ui.bed_text);
+    create_temp_cell(temp_row, "Chamber", &s_ui.chamber_text);
+
     lv_obj_t *quick = make_card(main_column, "QUICK ACCESS");
     lv_obj_set_size(quick, LV_PCT(100), 92);
     lv_obj_t *quick_row = lv_obj_create(quick);
@@ -862,11 +1964,40 @@ static void create_home_page(lv_obj_t *page)
     lv_obj_set_layout(quick_row, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(quick_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_column(quick_row, 8, 0);
-    const char *quick_names[] = {"Home axes", "Load", "Unload", "Lights"};
-    for (size_t i = 0; i < 4; ++i) {
-        lv_obj_t *button = make_action(quick_row, quick_names[i], false);
-        set_button_enabled(button, false);
-    }
+    /*
+     * Quick-access row.
+     *
+     * "Home axes" reuses the same CONFIRM_HOME dialog as the Move panel's
+     * Home button rather than dispatching G28 unconfirmed from a second
+     * entry point. The two macro buttons are direct triggers with no
+     * confirmation -- their names come from dt_printer_profile.h, so a
+     * printer that does not define them simply reports Klipper's error.
+     * Enabled state tracks model->can_home, mirroring the Move panel.
+     * Lights has no backing action yet and stays an inert placeholder.
+     */
+    s_ui.quick_home_button =
+        make_guarded_action(quick_row, "Home axes", &CONFIRM_HOME);
+    set_button_enabled(s_ui.quick_home_button, false);
+
+    lv_obj_t *quick_lights_button = make_action(quick_row, "Lights", false);
+    set_button_enabled(quick_lights_button, false);
+
+    s_ui.quick_clean_nozzle_button =
+        make_direct_action(
+            quick_row,
+            DT_PROFILE_QUICK1_LABEL,
+            DT_UI_ACTION_QUICK_MACRO_1
+        );
+    set_button_enabled(s_ui.quick_clean_nozzle_button, false);
+
+    s_ui.quick_macro2_button =
+        make_direct_action(
+            quick_row,
+            DT_PROFILE_QUICK2_LABEL,
+            DT_UI_ACTION_QUICK_MACRO_2
+        );
+
+    set_button_enabled(s_ui.quick_macro2_button, false);
 
     lv_obj_t *side = lv_obj_create(page);
     lv_obj_remove_style_all(side);
@@ -876,17 +2007,63 @@ static void create_home_page(lv_obj_t *page)
     lv_obj_set_flex_flow(side, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(side, 10, 0);
 
-    lv_obj_t *temperatures = make_card(side, "TEMPERATURES");
-    lv_obj_set_width(temperatures, LV_PCT(100));
-    lv_obj_set_flex_grow(temperatures, 1);
-    create_metric(temperatures, "Nozzle", &s_ui.nozzle_text);
-    create_metric(temperatures, "Bed", &s_ui.bed_text);
-    create_metric(temperatures, "Part fan", &s_ui.fan_text);
+    /*
+     * DT_WEBCAM_HOME_PANE
+     *
+     * The PRINTER card is gone -- the header already shows the address.
+     * The side column is now the webcam, sharing the single decoded frame
+     * with the dedicated webcam page and scaled to fit this pane.
+     */
+    lv_obj_t *webcam_card =
+        make_card(side, "WEBCAM");
 
-    lv_obj_t *printer = make_card(side, "PRINTER");
-    lv_obj_set_size(printer, LV_PCT(100), 118);
-    s_ui.printer_name = make_label(printer, "No paired printer", DT_COLOR_TEXT);
-    s_ui.printer_hint = make_label(printer, "Pair a same-LAN device to begin.", DT_COLOR_MUTED);
+    lv_obj_set_width(webcam_card, LV_PCT(100));
+    lv_obj_set_flex_grow(webcam_card, 1);
+
+    lv_obj_t *home_webcam_wrap =
+        lv_obj_create(webcam_card);
+
+    lv_obj_remove_style_all(home_webcam_wrap);
+    lv_obj_set_width(home_webcam_wrap, LV_PCT(100));
+    lv_obj_set_flex_grow(home_webcam_wrap, 1);
+
+    lv_obj_remove_flag(
+        home_webcam_wrap,
+        LV_OBJ_FLAG_SCROLLABLE
+    );
+
+    lv_obj_add_flag(
+        home_webcam_wrap,
+        LV_OBJ_FLAG_CLICKABLE
+    );
+
+    lv_obj_add_event_cb(
+        home_webcam_wrap,
+        direct_action_event,
+        LV_EVENT_CLICKED,
+        (void *)(uintptr_t)DT_UI_ACTION_WEBCAM_REFRESH
+    );
+
+    s_ui.home_webcam_image =
+        lv_image_create(home_webcam_wrap);
+
+    lv_image_set_antialias(
+        s_ui.home_webcam_image,
+        true
+    );
+
+    lv_obj_set_size(
+        s_ui.home_webcam_image,
+        LV_PCT(100),
+        LV_PCT(100)
+    );
+
+    lv_obj_center(s_ui.home_webcam_image);
+
+    lv_obj_add_flag(
+        s_ui.home_webcam_image,
+        LV_OBJ_FLAG_HIDDEN
+    );
 }
 
 static void select_tab(lv_obj_t *const *tabs, lv_obj_t *const *panels, size_t count,
@@ -992,6 +2169,11 @@ static void file_entry_event(lv_event_t *event)
     s_ui.files_model.layer_height_mm = 0.0f;
     s_ui.files_model.slicer[0] = '\0';
     s_ui.files_model.filament_type[0] = '\0';
+
+    s_ui.files_model.thumbnail_data = NULL;
+    s_ui.files_model.thumbnail_size = 0;
+    s_ui.files_model.thumbnail_width = 0;
+    s_ui.files_model.thumbnail_height = 0;
 
     snprintf(
         s_ui.files_model.detail_error,
@@ -1273,6 +2455,135 @@ static void render_files_model(void)
             !model->loading &&
             !print_active
     );
+
+    /*
+     * DT_FILE_THUMBNAIL_PREVIEW
+     *
+     * LVGL LodePNG accepts LV_IMAGE_SRC_VARIABLE and decodes the encoded PNG
+     * directly from lv_image_dsc_t::data.
+     */
+    if (
+        s_ui.file_thumbnail_row != NULL &&
+        s_ui.file_thumbnail_image != NULL
+    ) {
+        if (
+            !model->selected ||
+            model->thumbnail_data == NULL ||
+            model->thumbnail_size < 24U ||
+            model->thumbnail_width == 0U ||
+            model->thumbnail_height == 0U
+        ) {
+            lv_obj_add_flag(
+                s_ui.file_thumbnail_row,
+                LV_OBJ_FLAG_HIDDEN
+            );
+
+            memset(
+                &s_ui.file_thumbnail_dsc,
+                0,
+                sizeof(s_ui.file_thumbnail_dsc)
+            );
+        } else {
+            memset(
+                &s_ui.file_thumbnail_dsc,
+                0,
+                sizeof(s_ui.file_thumbnail_dsc)
+            );
+
+            s_ui.file_thumbnail_dsc.header.magic =
+                LV_IMAGE_HEADER_MAGIC;
+
+            /*
+             * Encoded PNG bytes loaded at runtime are intentionally RAW.
+             * LodePNG recognizes PNG magic in the data buffer.
+             */
+            s_ui.file_thumbnail_dsc.header.cf =
+                LV_COLOR_FORMAT_RAW;
+
+            s_ui.file_thumbnail_dsc.header.flags =
+                0;
+
+            s_ui.file_thumbnail_dsc.header.w =
+                0;
+
+            s_ui.file_thumbnail_dsc.header.h =
+                0;
+
+            s_ui.file_thumbnail_dsc.header.stride =
+                0;
+
+            s_ui.file_thumbnail_dsc.data_size =
+                model->thumbnail_size;
+
+            s_ui.file_thumbnail_dsc.data =
+                model->thumbnail_data;
+
+            lv_image_header_t decoded_header = {0};
+
+            lv_result_t info_result =
+                lv_image_decoder_get_info(
+                    &s_ui.file_thumbnail_dsc,
+                    &decoded_header
+                );
+
+            if (info_result == LV_RESULT_OK) {
+                lv_image_cache_drop(&s_ui.file_thumbnail_dsc);
+
+                lv_image_set_src(
+                    s_ui.file_thumbnail_image,
+                    &s_ui.file_thumbnail_dsc
+                );
+
+                /*
+                 * Scale whatever Orca embedded into our fixed 150x150 preview.
+                 * For the current 48x48 source this is 800 / 256 = 3.125x.
+                 */
+                uint32_t scale =
+                    decoded_header.w > 0
+                        ? (
+                            150U * 256U +
+                            decoded_header.w / 2U
+                        ) /
+                            decoded_header.w
+                        : 256U;
+
+                if (scale == 0U) {
+                    scale = 1U;
+                }
+
+                lv_image_set_scale(
+                    s_ui.file_thumbnail_image,
+                    scale
+                );
+
+                lv_obj_set_size(
+                    s_ui.file_thumbnail_image,
+                    150,
+                    150
+                );
+
+                lv_obj_remove_flag(
+                    s_ui.file_thumbnail_row,
+                    LV_OBJ_FLAG_HIDDEN
+                );
+
+                lv_obj_invalidate(
+                    s_ui.file_thumbnail_image
+                );
+            } else {
+                ESP_LOGE(
+                    TAG,
+                    "FILE_THUMBNAIL PNG decoder rejected in-memory source"
+                );
+
+                lv_obj_add_flag(
+                    s_ui.file_thumbnail_row,
+                    LV_OBJ_FLAG_HIDDEN
+                );
+            }
+        }
+    }
+
 }
 
 
@@ -1330,6 +2641,332 @@ static lv_obj_t *make_control_card(lv_obj_t *parent, const char *title, const ch
     return card;
 }
 
+
+static const char *aux_fan_kind_text(
+    dt_ui_fan_kind_t kind
+)
+{
+    switch (kind) {
+    case DT_UI_FAN_KIND_GENERIC:
+        return "Manual fan";
+    case DT_UI_FAN_KIND_CONTROLLER:
+        return "Automatic controller fan";
+    case DT_UI_FAN_KIND_HEATER:
+        return "Automatic heater fan";
+    case DT_UI_FAN_KIND_TEMPERATURE:
+        return "Automatic temperature fan";
+    default:
+        return "Fan";
+    }
+}
+
+
+static void aux_fan_slider_event(
+    lv_event_t *event
+)
+{
+    const size_t row =
+        (size_t)(uintptr_t)
+        lv_event_get_user_data(event);
+
+    if (
+        row >= s_ui.aux_manual_count ||
+        row >= 4 ||
+        s_ui.aux_manual_sliders[row] == NULL
+    ) {
+        return;
+    }
+
+    const lv_event_code_t code =
+        lv_event_get_code(event);
+
+    const int32_t raw =
+        lv_slider_get_value(
+            s_ui.aux_manual_sliders[row]
+        );
+
+    const uint8_t percent =
+        (uint8_t)(
+            raw < 0 ? 0 :
+            raw > 100 ? 100 :
+            raw
+        );
+
+    if (code == LV_EVENT_PRESSED) {
+        s_ui.aux_manual_dragging[row] = true;
+    }
+
+    if (
+        code == LV_EVENT_PRESSED ||
+        code == LV_EVENT_VALUE_CHANGED ||
+        code == LV_EVENT_RELEASED
+    ) {
+        char label[96] = {0};
+
+        snprintf(
+            label,
+            sizeof(label),
+            "%s  %u%%",
+            s_ui.aux_manual_names[row][0] != '\0'
+                ? s_ui.aux_manual_names[row]
+                : "Fan",
+            (unsigned)percent
+        );
+
+        lv_label_set_text(
+            s_ui.aux_manual_labels[row],
+            label
+        );
+    }
+
+    if (code != LV_EVENT_RELEASED) {
+        return;
+    }
+
+    s_ui.aux_manual_dragging[row] = false;
+
+    const size_t slot =
+        s_ui.aux_manual_slots[row];
+
+    if (slot >= DT_UI_AUX_FAN_MAX) {
+        return;
+    }
+
+    dispatch_action(
+        (dt_ui_action_t)(
+            DT_UI_ACTION_AUX_FAN_BASE +
+            slot *
+                DT_UI_AUX_FAN_LEVEL_COUNT +
+            percent
+        )
+    );
+}
+
+
+
+
+
+static void render_aux_fans(
+    const dt_ui_model_t *model
+)
+{
+    /*
+     * DT_DYNAMIC_AUX_FANS_DIRECT_ROWS
+     *
+     * Manual control is exposed only when:
+     *   - kind == fan_generic,
+     *   - the object is marked controllable,
+     *   - live speed telemetry is available,
+     *   - the printer is online.
+     */
+    if (
+        model == NULL ||
+        s_ui.aux_fan_cards[0] == NULL ||
+        s_ui.aux_fan_status[0] == NULL
+    ) {
+        return;
+    }
+
+    const bool online =
+        model->connection ==
+        DT_UI_CONNECTION_ONLINE;
+
+    char summary[640] = {0};
+    size_t used = 0;
+
+    for (
+        size_t i = 0;
+        i < model->aux_fan_count &&
+            i < DT_UI_AUX_FAN_MAX;
+        ++i
+    ) {
+        const dt_ui_aux_fan_t *fan =
+            &model->aux_fans[i];
+
+        char line[128] = {0};
+
+        if (!online) {
+            snprintf(
+                line,
+                sizeof(line),
+                "%s - offline",
+                fan->name != NULL
+                    ? fan->name
+                    : "Fan"
+            );
+        } else if (fan->speed_known) {
+            snprintf(
+                line,
+                sizeof(line),
+                "%s - %u%% - %s",
+                fan->name != NULL
+                    ? fan->name
+                    : "Fan",
+                (unsigned)fan->percent,
+                aux_fan_kind_text(fan->kind)
+            );
+        } else {
+            snprintf(
+                line,
+                sizeof(line),
+                "%s - speed unavailable - %s",
+                fan->name != NULL
+                    ? fan->name
+                    : "Fan",
+                aux_fan_kind_text(fan->kind)
+            );
+        }
+
+        int written =
+            snprintf(
+                summary + used,
+                sizeof(summary) - used,
+                "%s%s",
+                used == 0 ? "" : "\n",
+                line
+            );
+
+        if (
+            written < 0 ||
+            (size_t)written >=
+                sizeof(summary) - used
+        ) {
+            break;
+        }
+
+        used += (size_t)written;
+    }
+
+    if (model->aux_fan_count == 0) {
+        snprintf(
+            summary,
+            sizeof(summary),
+            "%s",
+            online
+                ? "No auxiliary Klipper fan objects discovered."
+                : "Printer offline"
+        );
+    }
+
+    lv_label_set_text(
+        s_ui.aux_fan_status[0],
+        summary
+    );
+
+    size_t manual_count = 0;
+
+    if (online) {
+        for (
+            size_t slot = 0;
+            slot < model->aux_fan_count &&
+                slot < DT_UI_AUX_FAN_MAX &&
+                manual_count < 4;
+            ++slot
+        ) {
+            const dt_ui_aux_fan_t *fan =
+                &model->aux_fans[slot];
+
+            const bool live_manual =
+                fan->kind ==
+                    DT_UI_FAN_KIND_GENERIC &&
+                fan->controllable &&
+                fan->speed_known;
+
+            if (!live_manual) {
+                continue;
+            }
+
+            s_ui.aux_manual_slots[manual_count] =
+                slot;
+
+            snprintf(
+                s_ui.aux_manual_names[manual_count],
+                sizeof(s_ui.aux_manual_names[manual_count]),
+                "%s",
+                fan->name != NULL
+                    ? fan->name
+                    : "Fan"
+            );
+
+            if (
+                s_ui.aux_manual_sliders[manual_count] != NULL &&
+                !s_ui.aux_manual_dragging[manual_count]
+            ) {
+                lv_slider_set_value(
+                    s_ui.aux_manual_sliders[manual_count],
+                    fan->percent,
+                    LV_ANIM_OFF
+                );
+            }
+
+            char label[96] = {0};
+
+            snprintf(
+                label,
+                sizeof(label),
+                "%s  %u%%",
+                fan->name != NULL
+                    ? fan->name
+                    : "Fan",
+                (unsigned)fan->percent
+            );
+
+            lv_label_set_text(
+                s_ui.aux_manual_labels[manual_count],
+                label
+            );
+
+            lv_obj_remove_flag(
+                s_ui.aux_manual_rows[manual_count],
+                LV_OBJ_FLAG_HIDDEN
+            );
+
+            if (
+                s_ui.aux_manual_sliders[manual_count] != NULL
+            ) {
+                lv_obj_remove_state(
+                    s_ui.aux_manual_sliders[manual_count],
+                    LV_STATE_DISABLED
+                );
+            }
+
+            ++manual_count;
+        }
+    }
+
+    s_ui.aux_manual_count =
+        manual_count;
+
+    for (
+        size_t row = manual_count;
+        row < 4;
+        ++row
+    ) {
+        if (s_ui.aux_manual_rows[row] != NULL) {
+            lv_obj_add_flag(
+                s_ui.aux_manual_rows[row],
+                LV_OBJ_FLAG_HIDDEN
+            );
+        }
+
+        s_ui.aux_manual_slots[row] =
+            DT_UI_AUX_FAN_MAX;
+
+        s_ui.aux_manual_names[row][0] = '\0';
+        s_ui.aux_manual_dragging[row] = false;
+
+        if (s_ui.aux_manual_sliders[row] != NULL) {
+            lv_obj_add_state(
+                s_ui.aux_manual_sliders[row],
+                LV_STATE_DISABLED
+            );
+        }
+    }
+}
+
+
+
+
 static void create_control_page(lv_obj_t *page)
 {
     static const char *names[] = {
@@ -1375,23 +3012,44 @@ static void create_control_page(lv_obj_t *page)
     s_ui.axes_text =
         lv_obj_get_child(motion, 1);
 
+    lv_obj_t *home_row = lv_obj_create(motion);
+    lv_obj_remove_style_all(home_row);
+    lv_obj_set_size(home_row, LV_PCT(100), 42);
+    lv_obj_set_layout(home_row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(home_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(home_row, 4, 0);
+
     s_ui.home_button =
         make_guarded_action(
-            motion,
+            home_row,
             "Home all axes",
             &CONFIRM_HOME
         );
 
-    size_card_action(
-        s_ui.home_button
-    );
+    /* DT_Z_TILT */
+    s_ui.z_tilt_button =
+        make_guarded_action(
+            home_row,
+            DT_PROFILE_LEVEL_LABEL,
+            &CONFIRM_Z_TILT
+        );
 
     lv_obj_t *jog =
         make_control_card(
             s_ui.control_panels[0],
             "JOG",
-            "XY ±10 mm   Z ±1 mm"
+            "Step size applies to X, Y and Z."
         );
+
+    /* DT_MOVE_STEP */
+    create_step_group(
+        jog,
+        DT_STEP_GROUP_MOVE,
+        DT_MOVE_STEPS,
+        DT_MOVE_STEP_COUNT,
+        s_ui.move_step_boxes,
+        "mm"
+    );
 
     lv_obj_t *jog_row =
         lv_obj_create(jog);
@@ -1430,22 +3088,36 @@ static void create_control_page(lv_obj_t *page)
         "Z +"
     };
 
-    static const dt_ui_action_t jog_actions[] = {
-        DT_UI_ACTION_JOG_X_NEG,
-        DT_UI_ACTION_JOG_X_POS,
-        DT_UI_ACTION_JOG_Y_NEG,
-        DT_UI_ACTION_JOG_Y_POS,
-        DT_UI_ACTION_JOG_Z_NEG,
-        DT_UI_ACTION_JOG_Z_POS
+    /*
+     * DT_MOVE_STEP
+     *
+     * The fixed-distance JOG actions can't carry the selected step, so
+     * these go through the move-request handler instead. user_data packs
+     * the axis and the sign: (axis << 1) | positive.
+     */
+    static const uintptr_t jog_targets[] = {
+        (DT_UI_MOVE_AXIS_X << 1) | 0U,
+        (DT_UI_MOVE_AXIS_X << 1) | 1U,
+        (DT_UI_MOVE_AXIS_Y << 1) | 0U,
+        (DT_UI_MOVE_AXIS_Y << 1) | 1U,
+        (DT_UI_MOVE_AXIS_Z << 1) | 0U,
+        (DT_UI_MOVE_AXIS_Z << 1) | 1U
     };
 
     for (size_t i = 0; i < 6; ++i) {
         s_ui.jog_buttons[i] =
-            make_direct_action(
+            make_action(
                 jog_row,
                 jog_names[i],
-                jog_actions[i]
+                false
             );
+
+        lv_obj_add_event_cb(
+            s_ui.jog_buttons[i],
+            jog_event,
+            LV_EVENT_CLICKED,
+            (void *)jog_targets[i]
+        );
 
         lv_obj_set_size(
             s_ui.jog_buttons[i],
@@ -1472,15 +3144,41 @@ static void create_control_page(lv_obj_t *page)
     s_ui.nozzle_control_text =
         lv_obj_get_child(nozzle, 1);
 
+    lv_obj_t *nozzle_row =
+        lv_obj_create(nozzle);
+
+    lv_obj_remove_style_all(nozzle_row);
+    lv_obj_set_size(nozzle_row, LV_PCT(100), 42);
+    lv_obj_set_layout(nozzle_row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(nozzle_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(nozzle_row, 4, 0);
+
     s_ui.heat_button =
         make_guarded_action(
-            nozzle,
-            "Set 220 °C",
+            nozzle_row,
+            "220 °C",
             &CONFIRM_HEAT
         );
 
-    size_card_action(
-        s_ui.heat_button
+    /* DT_TEMP_ENTRY */
+    s_ui.nozzle_set_button =
+        make_action(nozzle_row, "Set...", false);
+
+    lv_obj_add_event_cb(
+        s_ui.nozzle_set_button,
+        keypad_open_event,
+        LV_EVENT_CLICKED,
+        (void *)(uintptr_t)DT_UI_HEATER_NOZZLE
+    );
+
+    s_ui.nozzle_cooldown_button =
+        make_action(nozzle_row, "Cooldown", false);
+
+    lv_obj_add_event_cb(
+        s_ui.nozzle_cooldown_button,
+        cooldown_event,
+        LV_EVENT_CLICKED,
+        (void *)(uintptr_t)DT_UI_HEATER_NOZZLE
     );
 
     lv_obj_t *bed =
@@ -1517,18 +3215,16 @@ static void create_control_page(lv_obj_t *page)
     );
 
     static const char *bed_names[] = {
-        "Off",
         "60 °C",
-        "100 °C"
+        "110 °C"
     };
 
     static const dt_ui_action_t bed_actions[] = {
-        DT_UI_ACTION_BED_OFF,
         DT_UI_ACTION_BED_60,
-        DT_UI_ACTION_BED_100
+        DT_UI_ACTION_BED_110
     };
 
-    for (size_t i = 0; i < 3; ++i) {
+    for (size_t i = 0; i < 2; ++i) {
         s_ui.bed_buttons[i] =
             make_direct_action(
                 bed_row,
@@ -1538,42 +3234,90 @@ static void create_control_page(lv_obj_t *page)
     }
 
     /*
+     * DT_TEMP_ENTRY
+     *
+     * The old "Off" preset is now Cooldown, routed through the same
+     * numeric path as the keypad (target 0) so both heaters turn off by
+     * exactly one mechanism.
+     */
+    s_ui.bed_set_button =
+        make_action(bed_row, "Set...", false);
+
+    lv_obj_add_event_cb(
+        s_ui.bed_set_button,
+        keypad_open_event,
+        LV_EVENT_CLICKED,
+        (void *)(uintptr_t)DT_UI_HEATER_BED
+    );
+
+    s_ui.bed_cooldown_button =
+        make_action(bed_row, "Cooldown", false);
+
+    lv_obj_add_event_cb(
+        s_ui.bed_cooldown_button,
+        cooldown_event,
+        LV_EVENT_CLICKED,
+        (void *)(uintptr_t)DT_UI_HEATER_BED
+    );
+
+    /*
      * EXTRUSION
      */
     lv_obj_t *extrude =
         make_control_card(
             s_ui.control_panels[2],
             "ACTIVE EXTRUDER",
-            "10 mm manual move"
+            "Distance and speed apply to both directions."
         );
 
-    s_ui.extrude_button =
-        make_guarded_action(
-            extrude,
-            "Extrude 10 mm",
-            &CONFIRM_EXTRUDE
-        );
-
-    size_card_action(
-        s_ui.extrude_button
+    /* DT_MOVE_STEP */
+    create_step_group(
+        extrude,
+        DT_STEP_GROUP_EXTRUDE_STEP,
+        DT_MOVE_STEPS,
+        DT_MOVE_STEP_COUNT,
+        s_ui.extrude_step_boxes,
+        "mm"
     );
 
-    lv_obj_t *retract =
-        make_control_card(
-            s_ui.control_panels[2],
-            "RETRACT",
-            "10 mm manual move"
-        );
+    create_step_group(
+        extrude,
+        DT_STEP_GROUP_EXTRUDE_SPEED,
+        DT_EXTRUDE_SPEEDS,
+        DT_EXTRUDE_SPEED_COUNT,
+        s_ui.extrude_speed_boxes,
+        "mm/s"
+    );
+
+    lv_obj_t *extrude_row = lv_obj_create(extrude);
+    lv_obj_remove_style_all(extrude_row);
+    lv_obj_set_size(extrude_row, LV_PCT(100), 42);
+    lv_obj_set_layout(extrude_row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(extrude_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(extrude_row, 4, 0);
+
+    /*
+     * Still confirmed before sending, as the fixed 10 mm buttons were --
+     * the dialog body is filled in at tap time with the selected values.
+     */
+    s_ui.extrude_button =
+        make_action(extrude_row, "Extrude", false);
+
+    lv_obj_add_event_cb(
+        s_ui.extrude_button,
+        extrude_event,
+        LV_EVENT_CLICKED,
+        (void *)(uintptr_t)1U
+    );
 
     s_ui.retract_button =
-        make_guarded_action(
-            retract,
-            "Retract 10 mm",
-            &CONFIRM_RETRACT
-        );
+        make_action(extrude_row, "Retract", false);
 
-    size_card_action(
-        s_ui.retract_button
+    lv_obj_add_event_cb(
+        s_ui.retract_button,
+        extrude_event,
+        LV_EVENT_CLICKED,
+        (void *)(uintptr_t)0U
     );
 
     /*
@@ -1633,11 +3377,186 @@ static void create_control_page(lv_obj_t *page)
             );
     }
 
-    make_control_card(
-        s_ui.control_panels[3],
-        "AUXILIARY FANS",
-        "Printer-specific auxiliary fan discovery comes in the device-capability layer."
+    /*
+     * DT_DYNAMIC_AUX_FANS_COMPACT
+     *
+     * One shallow content card avoids the crash-prone nested fan UI tree.
+     */
+    lv_obj_t *aux_fans =
+        make_control_card(
+            s_ui.control_panels[3],
+            "AUXILIARY FANS",
+            "Waiting for fan telemetry..."
+        );
+
+    s_ui.aux_fan_cards[0] =
+        aux_fans;
+
+    s_ui.aux_fan_title[0] =
+        lv_obj_get_child(
+            aux_fans,
+            0
+        );
+
+    s_ui.aux_fan_status[0] =
+        lv_obj_get_child(
+            aux_fans,
+            1
+        );
+
+    /*
+     * DT_AUX_FAN_SLIDER_SPACING_FIX
+     * Keep telemetry and manual rows visually separated.
+     */
+    lv_obj_set_style_pad_row(
+        aux_fans,
+        10,
+        0
     );
+
+    lv_label_set_long_mode(
+        s_ui.aux_fan_status[0],
+        LV_LABEL_LONG_MODE_WRAP
+    );
+
+    lv_obj_set_width(
+        s_ui.aux_fan_status[0],
+        LV_PCT(100)
+    );
+
+
+    /*
+     * DT_DYNAMIC_AUX_FANS_DIRECT_ROWS
+     *
+     * One auxiliary card, up to four shallow manual fan rows.
+     */
+    for (
+        size_t row_index = 0;
+        row_index < 4;
+        ++row_index
+    ) {
+        lv_obj_t *row =
+            lv_obj_create(aux_fans);
+
+        s_ui.aux_manual_rows[row_index] =
+            row;
+
+        lv_obj_remove_style_all(row);
+
+        /* DT_AUX_FAN_SLIDER_SPACING_FIX */
+        lv_obj_set_size(
+            row,
+            LV_PCT(100),
+            60
+        );
+
+        lv_obj_set_flex_align(
+            row,
+            LV_FLEX_ALIGN_START,
+            LV_FLEX_ALIGN_CENTER,
+            LV_FLEX_ALIGN_CENTER
+        );
+
+        lv_obj_set_layout(
+            row,
+            LV_LAYOUT_FLEX
+        );
+
+        lv_obj_set_flex_flow(
+            row,
+            LV_FLEX_FLOW_ROW
+        );
+
+        lv_obj_set_style_pad_column(
+            row,
+            4,
+            0
+        );
+
+        lv_obj_t *label =
+            make_label(
+                row,
+                "--",
+                DT_COLOR_TEXT
+            );
+
+        s_ui.aux_manual_labels[row_index] =
+            label;
+
+        lv_obj_set_width(
+            label,
+            150
+        );
+
+        lv_label_set_long_mode(
+            label,
+            LV_LABEL_LONG_MODE_DOTS
+        );
+
+        /*
+         * DT_DYNAMIC_AUX_FAN_SLIDERS
+         *
+         * Live label updates while dragging; command is sent on release.
+         */
+        lv_obj_t *slider =
+            lv_slider_create(row);
+
+        s_ui.aux_manual_sliders[row_index] =
+            slider;
+
+        lv_slider_set_range(
+            slider,
+            0,
+            100
+        );
+
+        lv_slider_set_value(
+            slider,
+            0,
+            LV_ANIM_OFF
+        );
+
+        lv_obj_set_height(
+            slider,
+            34
+        );
+
+        /*
+         * Give the knob clearance from the row clip boundary and keep rows
+         * visually separated even with a large touch target.
+         */
+        lv_obj_set_style_margin_top(
+            slider,
+            6,
+            0
+        );
+
+        lv_obj_set_style_margin_bottom(
+            slider,
+            6,
+            0
+        );
+
+        lv_obj_set_flex_grow(
+            slider,
+            1
+        );
+
+        lv_obj_add_event_cb(
+            slider,
+            aux_fan_slider_event,
+            LV_EVENT_ALL,
+            (void *)(uintptr_t)row_index
+        );
+
+        s_ui.aux_manual_slots[row_index] =
+            DT_UI_AUX_FAN_MAX;
+
+        lv_obj_add_flag(
+            row,
+            LV_OBJ_FLAG_HIDDEN
+        );
+    }
 
     select_tab(
         s_ui.control_tabs,
@@ -1873,15 +3792,34 @@ static void render_filament_model(void)
                 primary_label,
                 recovery_mode
                     ? "Reset"
-                    : "Load"
+                    /*
+                     * DT_AFC_UNLOAD_LOADED_LANE: a lane already loaded into
+                     * the tool has nothing left for "Load" to do, so the
+                     * same button switches to a real Unload action instead.
+                     */
+                    : (lane->tool_loaded ? "Unload" : "Load")
             );
         }
 
+        /*
+         * DT_AFC_LOAD_STATE_AWARE / DT_AFC_UNLOAD_LOADED_LANE
+         * A lane that's already the active tool load has nothing left for
+         * "Load" (BT_CHANGE_TOOL) to do -- that path is only offered to
+         * lanes that aren't currently loaded. The already-loaded lane gets
+         * "Unload" (TOOL_UNLOAD) instead, gated on its own capability flag.
+         */
         const bool can_change =
             !recovery_mode &&
             model->afc_actions_enabled &&
             model->has_bt_change_tool &&
-            lane->prep;
+            lane->prep &&
+            !lane->tool_loaded;
+
+        const bool can_unload =
+            !recovery_mode &&
+            model->afc_actions_enabled &&
+            model->has_afc_tool_unload &&
+            lane->tool_loaded;
 
         /*
          * Recovery reset is allowed while paused, but never while the
@@ -1905,7 +3843,7 @@ static void render_filament_model(void)
             s_ui.afc_lane_load_button[slot],
             recovery_mode
                 ? can_reset
-                : can_change
+                : (lane->tool_loaded ? can_unload : can_change)
         );
 
         set_button_enabled(
@@ -1998,6 +3936,8 @@ static void show_afc_confirmation(
 )
 {
     s_pending_filament_request_valid = true;
+    s_pending_move_request_valid = false;
+    s_pending_printer_index = -1;
     s_pending_filament_request = request;
     s_pending_filament_lane = lane_number;
 
@@ -2127,6 +4067,34 @@ static void afc_lane_load_event(lv_event_t *event)
         return;
     }
 
+    /*
+     * DT_AFC_UNLOAD_LOADED_LANE
+     * This lane is already the active tool load -- there's nothing for
+     * "Load" to do, so the same button instead offers to unload it via
+     * TOOL_UNLOAD (which always targets whatever's actually in the
+     * toolhead; runtime double-checks this lane is still the one AFC
+     * reports as tool_loaded before sending it).
+     */
+    if (lane->tool_loaded) {
+        snprintf(
+            body,
+            sizeof(body),
+            "Run TOOL_UNLOAD?\n"
+            "AFC will unload %s from the toolhead back into its lane.",
+            lane->name
+        );
+
+        show_afc_confirmation(
+            DT_UI_FILAMENT_REQUEST_UNLOAD_LANE,
+            lane_number,
+            "Unload AFC lane?",
+            body,
+            "Unload"
+        );
+
+        return;
+    }
+
     snprintf(
         body,
         sizeof(body),
@@ -2226,6 +4194,10 @@ static const char *system_connection_text(
 
     case DT_UI_CONNECTION_CONNECTING:
         return "Connecting";
+
+    /* DT_KLIPPER_ERROR */
+    case DT_UI_CONNECTION_ERROR:
+        return "Klipper error";
 
     default:
         return "Offline";
@@ -2674,31 +4646,730 @@ static void create_settings_page(lv_obj_t *page)
 }
 
 
-static void create_filament_page(lv_obj_t *page)
+/*
+ * DT_WEBCAM_FULL_DECODE
+ *
+ * Decode the encoded snapshot into one complete RGB888 frame.
+ *
+ * TJpgDec is a partial decoder: lv_image_decoder_open() produces no pixel
+ * buffer, and LVGL pulls the picture out one MCU block at a time during
+ * every draw pass -- re-decoding the JPEG on every redraw, and giving no
+ * single buffer to work from.
+ *
+ * Running the block loop once here assembles the whole frame, which is what
+ * webcam_show_frame() then box-averages down to each pane's size. It is also
+ * why scaling could never be left to LVGL: lv_draw's partial path transforms
+ * each decoded block about its own area rather than about the whole image,
+ * so a scale factor over a tiled source renders garbage.
+ */
+static bool webcam_decode_to_rgb(
+    uint32_t *width_out,
+    uint32_t *height_out
+)
 {
-    ESP_LOGI(TAG, "FILAMENT_BUILD begin");
+    *width_out = 0;
+    *height_out = 0;
 
-    lv_obj_t *heading_row =
-        create_page_heading(
-            page,
-            "Filament",
-            "AFC lanes, printer macros, and manual extruder controls."
+    lv_image_decoder_dsc_t dsc = {0};
+
+    if (
+        lv_image_decoder_open(
+            &dsc,
+            &s_ui.webcam_dsc,
+            NULL
+        ) != LV_RESULT_OK
+    ) {
+        return false;
+    }
+
+    const uint32_t width = dsc.header.w;
+    const uint32_t height = dsc.header.h;
+
+    if (width == 0 || height == 0) {
+        lv_image_decoder_close(&dsc);
+        return false;
+    }
+
+    const size_t stride = (size_t)width * 3U;
+    const size_t needed = stride * (size_t)height;
+
+    if (s_ui.webcam_rgb_capacity < needed) {
+        free(s_ui.webcam_rgb_data);
+
+        s_ui.webcam_rgb_data =
+            heap_caps_malloc(
+                needed,
+                MALLOC_CAP_SPIRAM |
+                MALLOC_CAP_8BIT
+            );
+
+        s_ui.webcam_rgb_capacity =
+            s_ui.webcam_rgb_data != NULL
+                ? needed
+                : 0;
+    }
+
+    if (s_ui.webcam_rgb_data == NULL) {
+        ESP_LOGW(
+            TAG,
+            "webcam: no PSRAM for a %ux%u frame",
+            (unsigned)width,
+            (unsigned)height
         );
 
-    lv_obj_t *status =
+        lv_image_decoder_close(&dsc);
+        return false;
+    }
+
+    const lv_area_t full_area = {
+        .x1 = 0,
+        .y1 = 0,
+        .x2 = (int32_t)width - 1,
+        .y2 = (int32_t)height - 1
+    };
+
+    /*
+     * LV_COORD_MIN in y1 is the decoder's "this is the first block"
+     * signal -- it seeds its MCU walk from that sentinel.
+     */
+    lv_area_t block = {
+        .x1 = LV_COORD_MIN,
+        .y1 = LV_COORD_MIN,
+        .x2 = LV_COORD_MIN,
+        .y2 = LV_COORD_MIN
+    };
+
+    uint32_t rows_filled = 0;
+
+    while (
+        lv_image_decoder_get_area(
+            &dsc,
+            &full_area,
+            &block
+        ) == LV_RESULT_OK
+    ) {
+        const lv_draw_buf_t *decoded = dsc.decoded;
+
+        if (decoded == NULL || decoded->data == NULL) {
+            break;
+        }
+
+        const int32_t block_w = lv_area_get_width(&block);
+        const int32_t block_h = lv_area_get_height(&block);
+
+        if (
+            block.x1 < 0 ||
+            block.y1 < 0 ||
+            block_w <= 0 ||
+            block_h <= 0 ||
+            (uint32_t)(block.x1 + block_w) > width ||
+            (uint32_t)(block.y1 + block_h) > height
+        ) {
+            continue;
+        }
+
+        for (int32_t row = 0; row < block_h; ++row) {
+            memcpy(
+                s_ui.webcam_rgb_data +
+                    ((size_t)(block.y1 + row) * stride) +
+                    ((size_t)block.x1 * 3U),
+                decoded->data +
+                    ((size_t)row * (size_t)decoded->header.stride),
+                (size_t)block_w * 3U
+            );
+        }
+
+        rows_filled =
+            (uint32_t)(block.y1 + block_h);
+    }
+
+    lv_image_decoder_close(&dsc);
+
+    if (rows_filled == 0) {
+        return false;
+    }
+
+    if (rows_filled < height) {
+        ESP_LOGW(
+            TAG,
+            "webcam: partial decode, %u of %u rows",
+            (unsigned)rows_filled,
+            (unsigned)height
+        );
+    }
+
+    *width_out = width;
+    *height_out = height;
+
+    return true;
+}
+
+
+/*
+ * DT_WEBCAM_HOME_PANE
+ *
+ * Point one image widget at the decoded frame. Both the webcam page and
+ * the home pane draw the same buffer; each fills its own container and
+ * lets CONTAIN letterbox the frame into it, so the aspect ratio is kept,
+ * the whole frame is always visible, and neither ever scrolls.
+ */
+static void webcam_hide_frame(void)
+{
+    if (s_ui.webcam_image != NULL) {
+        lv_obj_add_flag(
+            s_ui.webcam_image,
+            LV_OBJ_FLAG_HIDDEN
+        );
+    }
+
+    if (s_ui.home_webcam_image != NULL) {
+        lv_obj_add_flag(
+            s_ui.home_webcam_image,
+            LV_OBJ_FLAG_HIDDEN
+        );
+    }
+}
+
+
+/*
+ * DT_WEBCAM_PRESCALE
+ *
+ * Box-average downscale. Always a reduction here (640x480 into panes of at
+ * most ~520 wide), and averaging the source rectangle behind each destination
+ * pixel is both better looking than nearest-neighbour and cheap -- it touches
+ * each source pixel once.
+ *
+ * Channel order is irrelevant: each of the three bytes is averaged
+ * independently and written back in the position it came from.
+ */
+static void webcam_scale_rgb888(
+    const uint8_t *src,
+    uint32_t src_w,
+    uint32_t src_h,
+    uint8_t *dst,
+    uint32_t dst_w,
+    uint32_t dst_h
+)
+{
+    for (uint32_t y = 0; y < dst_h; ++y) {
+        uint32_t sy0 = (uint32_t)(((uint64_t)y * src_h) / dst_h);
+        uint32_t sy1 = (uint32_t)(((uint64_t)(y + 1) * src_h) / dst_h);
+
+        if (sy1 <= sy0) {
+            sy1 = sy0 + 1;
+        }
+
+        if (sy1 > src_h) {
+            sy1 = src_h;
+        }
+
+        for (uint32_t x = 0; x < dst_w; ++x) {
+            uint32_t sx0 = (uint32_t)(((uint64_t)x * src_w) / dst_w);
+            uint32_t sx1 = (uint32_t)(((uint64_t)(x + 1) * src_w) / dst_w);
+
+            if (sx1 <= sx0) {
+                sx1 = sx0 + 1;
+            }
+
+            if (sx1 > src_w) {
+                sx1 = src_w;
+            }
+
+            uint32_t a = 0;
+            uint32_t b = 0;
+            uint32_t d = 0;
+            uint32_t n = 0;
+
+            for (uint32_t sy = sy0; sy < sy1; ++sy) {
+                const uint8_t *row =
+                    src +
+                    ((size_t)sy * src_w + sx0) * 3U;
+
+                for (uint32_t sx = sx0; sx < sx1; ++sx) {
+                    a += row[0];
+                    b += row[1];
+                    d += row[2];
+                    row += 3;
+                    ++n;
+                }
+            }
+
+            uint8_t *out =
+                dst + ((size_t)y * dst_w + x) * 3U;
+
+            out[0] = (uint8_t)(a / n);
+            out[1] = (uint8_t)(b / n);
+            out[2] = (uint8_t)(d / n);
+        }
+    }
+}
+
+
+static void webcam_show_frame(
+    lv_obj_t *image,
+    dt_webcam_view_t *view
+)
+{
+    if (image == NULL || s_ui.webcam_rgb_data == NULL) {
+        return;
+    }
+
+    const uint32_t src_w = s_ui.webcam_rgb_dsc.header.w;
+    const uint32_t src_h = s_ui.webcam_rgb_dsc.header.h;
+
+    if (src_w == 0 || src_h == 0) {
+        return;
+    }
+
+    lv_obj_t *pane = lv_obj_get_parent(image);
+
+    if (pane == NULL) {
+        return;
+    }
+
+    /* Sizes are only meaningful once layout has run. */
+    lv_obj_update_layout(pane);
+
+    const int32_t box_w = lv_obj_get_content_width(pane);
+    const int32_t box_h = lv_obj_get_content_height(pane);
+
+    if (box_w <= 0 || box_h <= 0) {
+        return;
+    }
+
+    /* Fit inside the pane, aspect preserved, integer maths throughout. */
+    uint32_t dst_w = (uint32_t)box_w;
+    uint32_t dst_h = (dst_w * src_h) / src_w;
+
+    if (dst_h > (uint32_t)box_h) {
+        dst_h = (uint32_t)box_h;
+        dst_w = (dst_h * src_w) / src_h;
+    }
+
+    if (dst_w == 0 || dst_h == 0) {
+        return;
+    }
+
+    const bool stale =
+        view->data == NULL ||
+        view->width != dst_w ||
+        view->height != dst_h ||
+        view->revision != s_ui.webcam_decoded_revision;
+
+    if (stale) {
+        const size_t needed =
+            (size_t)dst_w * (size_t)dst_h * 3U;
+
+        if (view->capacity < needed) {
+            free(view->data);
+
+            view->data =
+                heap_caps_malloc(
+                    needed,
+                    MALLOC_CAP_SPIRAM |
+                    MALLOC_CAP_8BIT
+                );
+
+            view->capacity =
+                view->data != NULL ? needed : 0;
+        }
+
+        if (view->data == NULL) {
+            return;
+        }
+
+        webcam_scale_rgb888(
+            s_ui.webcam_rgb_data,
+            src_w,
+            src_h,
+            view->data,
+            dst_w,
+            dst_h
+        );
+
+        view->width = dst_w;
+        view->height = dst_h;
+        view->revision = s_ui.webcam_decoded_revision;
+
+        memset(&view->dsc, 0, sizeof(view->dsc));
+        view->dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+        view->dsc.header.cf = LV_COLOR_FORMAT_RGB888;
+        view->dsc.header.w = dst_w;
+        view->dsc.header.h = dst_h;
+        view->dsc.header.stride = dst_w * 3U;
+        view->dsc.data = view->data;
+        view->dsc.data_size = (uint32_t)needed;
+
+        /* Fixed address reused per frame -- same cache hazard as elsewhere. */
+        lv_image_cache_drop(&view->dsc);
+    }
+
+    lv_image_set_src(image, &view->dsc);
+
+    /*
+     * Exactly the bitmap's size and no inner alignment, so LVGL blits
+     * without a transform. Centring is the pane's job now.
+     */
+    lv_obj_set_size(
+        image,
+        (int32_t)dst_w,
+        (int32_t)dst_h
+    );
+
+    lv_image_set_inner_align(
+        image,
+        LV_IMAGE_ALIGN_DEFAULT
+    );
+
+    lv_obj_center(image);
+
+    lv_obj_remove_flag(
+        image,
+        LV_OBJ_FLAG_HIDDEN
+    );
+}
+
+
+/*
+ * DT_WEBCAM_SNAPSHOT
+ *
+ * Renders whatever s_ui.webcam_model currently holds: a status line above
+ * the viewport, plus the decoded frame scaled to fit inside it.
+ */
+static void render_webcam_model(void)
+{
+    const dt_ui_webcam_model_t *model =
+        &s_ui.webcam_model;
+
+    if (s_ui.webcam_status_text != NULL) {
+        /*
+         * Never assert "no webcam configured" as a default -- that is a
+         * claim about Moonraker we have not checked yet on a freshly
+         * opened page. dt_runtime.c puts the real finding in status_text
+         * once discovery has actually run, and that wins here.
+         */
+        const char *text = "TAP TO REFRESH";
+
+        if (model->status_text[0] != '\0') {
+            text = model->status_text;
+        } else if (model->loading) {
+            text = "Loading snapshot...";
+        }
+
+        lv_label_set_text(
+            s_ui.webcam_status_text,
+            text
+        );
+    }
+
+    /*
+      * DT_WEBCAM_HOME_PANE
+      *
+      * Either view is reason enough to decode. Gating this on the webcam
+      * page's widgets meant that whenever only the home pane existed --
+      * the state at boot, and any time the webcam page had been recycled
+      * -- this returned before decoding and the home pane stayed empty.
+      */
+    if (
+        s_ui.webcam_image == NULL &&
+        s_ui.home_webcam_image == NULL
+    ) {
+        return;
+    }
+
+    if (
+        !model->has_image ||
+        model->jpeg_data == NULL ||
+        model->jpeg_size == 0
+    ) {
+        webcam_hide_frame();
+
+        memset(
+            &s_ui.webcam_dsc,
+            0,
+            sizeof(s_ui.webcam_dsc)
+        );
+
+        return;
+    }
+
+    /*
+     * DT_WEBCAM_REVISION
+     *
+     * Every push re-entered this path, so a refresh decoded twice: once for
+     * the loading=true push (re-decoding the PREVIOUS frame for nothing) and
+     * again for the new one. Each decode holds the LVGL lock long enough to
+     * starve the other model pushes. Decode only when the bytes actually
+     * changed; the show_frame calls below are cheap and still run every
+     * time, so a rebuilt page still gets its source set.
+     */
+    if (
+        s_ui.webcam_rgb_data != NULL &&
+        model->revision != 0 &&
+        model->revision == s_ui.webcam_decoded_revision
+    ) {
+        webcam_show_frame(
+            s_ui.webcam_image,
+            &s_ui.webcam_view_page
+        );
+
+        webcam_show_frame(
+            s_ui.home_webcam_image,
+            &s_ui.webcam_view_home
+        );
+
+        return;
+    }
+
+    memset(
+        &s_ui.webcam_dsc,
+        0,
+        sizeof(s_ui.webcam_dsc)
+    );
+
+    s_ui.webcam_dsc.header.magic =
+        LV_IMAGE_HEADER_MAGIC;
+
+    /*
+     * The encoded bytes are intentionally RAW -- TJpgDec sniffs the JPEG
+     * signature out of the buffer. dt_runtime.c splices in a JFIF APP0
+     * segment beforehand so that sniff actually succeeds.
+     */
+    s_ui.webcam_dsc.header.cf =
+        LV_COLOR_FORMAT_RAW;
+
+    s_ui.webcam_dsc.data_size =
+        model->jpeg_size;
+
+    s_ui.webcam_dsc.data =
+        model->jpeg_data;
+
+    /*
+     * The image cache is keyed on the source pointer, and &s_ui.webcam_dsc
+     * is a fixed address reused for every frame -- so drop the previous
+     * snapshot's entry before decoding, or lv_image_decoder_open() will
+     * short-circuit on it and hand back a stale, zeroed header.
+     */
+    lv_image_cache_drop(&s_ui.webcam_dsc);
+
+    uint32_t width = 0;
+    uint32_t height = 0;
+
+    const bool decoded =
+        webcam_decode_to_rgb(
+            &width,
+            &height
+        );
+
+    if (!decoded) {
+        webcam_hide_frame();
+
+        if (s_ui.webcam_status_text != NULL) {
+            lv_label_set_text(
+                s_ui.webcam_status_text,
+                "Snapshot decode failed. Tap to retry."
+            );
+        }
+
+        return;
+    }
+
+    memset(
+        &s_ui.webcam_rgb_dsc,
+        0,
+        sizeof(s_ui.webcam_rgb_dsc)
+    );
+
+    s_ui.webcam_rgb_dsc.header.magic =
+        LV_IMAGE_HEADER_MAGIC;
+
+    s_ui.webcam_rgb_dsc.header.cf =
+        LV_COLOR_FORMAT_RGB888;
+
+    s_ui.webcam_rgb_dsc.header.w = width;
+    s_ui.webcam_rgb_dsc.header.h = height;
+
+    s_ui.webcam_rgb_dsc.header.stride =
+        width * 3U;
+
+    s_ui.webcam_rgb_dsc.data =
+        s_ui.webcam_rgb_data;
+
+    s_ui.webcam_rgb_dsc.data_size =
+        width * height * 3U;
+
+    s_ui.webcam_decoded_revision = model->revision;
+
+    /* Same fixed-address cache hazard as above, for the decoded frame. */
+    lv_image_cache_drop(&s_ui.webcam_rgb_dsc);
+
+    webcam_show_frame(
+        s_ui.webcam_image,
+        &s_ui.webcam_view_page
+    );
+
+    webcam_show_frame(
+        s_ui.home_webcam_image,
+        &s_ui.webcam_view_home
+    );
+}
+
+
+static void create_webcam_page(lv_obj_t *page)
+{
+    /*
+     * DT_WEBCAM_BARE_PAGE
+     *
+     * No page heading and no control card -- the page is the snapshot,
+     * with a single tap prompt above it. The viewport takes all the
+     * remaining height and the frame is scaled to fit inside it, so
+     * there is never anything to scroll.
+     */
+    lv_obj_set_layout(page, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(page, 7, 0);
+    lv_obj_remove_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_ui.webcam_status_text =
         make_label(
-            heading_row,
-            "Capability-aware",
+            page,
+            "TAP TO REFRESH",
             DT_COLOR_MUTED
         );
 
-    lv_obj_set_flex_grow(status, 1);
+    lv_label_set_long_mode(
+        s_ui.webcam_status_text,
+        LV_LABEL_LONG_MODE_WRAP
+    );
+
+    lv_obj_set_width(
+        s_ui.webcam_status_text,
+        LV_PCT(100)
+    );
 
     lv_obj_set_style_text_align(
-        status,
-        LV_TEXT_ALIGN_RIGHT,
+        s_ui.webcam_status_text,
+        LV_TEXT_ALIGN_CENTER,
         0
     );
+
+    s_ui.webcam_image_wrap =
+        lv_obj_create(page);
+
+    lv_obj_remove_style_all(
+        s_ui.webcam_image_wrap
+    );
+
+    lv_obj_set_width(
+        s_ui.webcam_image_wrap,
+        LV_PCT(100)
+    );
+
+    lv_obj_set_flex_grow(
+        s_ui.webcam_image_wrap,
+        1
+    );
+
+    lv_obj_set_style_bg_color(
+        s_ui.webcam_image_wrap,
+        color(DT_COLOR_SURFACE),
+        0
+    );
+
+    lv_obj_set_style_bg_opa(
+        s_ui.webcam_image_wrap,
+        LV_OPA_COVER,
+        0
+    );
+
+    lv_obj_set_style_border_color(
+        s_ui.webcam_image_wrap,
+        color(DT_COLOR_BORDER),
+        0
+    );
+
+    lv_obj_set_style_border_width(
+        s_ui.webcam_image_wrap,
+        1,
+        0
+    );
+
+    lv_obj_set_style_radius(
+        s_ui.webcam_image_wrap,
+        8,
+        0
+    );
+
+    lv_obj_remove_flag(
+        s_ui.webcam_image_wrap,
+        LV_OBJ_FLAG_SCROLLABLE
+    );
+
+    lv_obj_add_flag(
+        s_ui.webcam_image_wrap,
+        LV_OBJ_FLAG_CLICKABLE
+    );
+
+    lv_obj_add_event_cb(
+        s_ui.webcam_image_wrap,
+        direct_action_event,
+        LV_EVENT_CLICKED,
+        (void *)(uintptr_t)DT_UI_ACTION_WEBCAM_REFRESH
+    );
+
+    s_ui.webcam_image =
+        lv_image_create(
+            s_ui.webcam_image_wrap
+        );
+
+    lv_image_set_antialias(
+        s_ui.webcam_image,
+        true
+    );
+
+    lv_obj_set_size(
+        s_ui.webcam_image,
+        LV_PCT(100),
+        LV_PCT(100)
+    );
+
+    lv_obj_center(
+        s_ui.webcam_image
+    );
+
+    lv_obj_add_flag(
+        s_ui.webcam_image,
+        LV_OBJ_FLAG_HIDDEN
+    );
+
+    memset(
+        &s_ui.webcam_dsc,
+        0,
+        sizeof(s_ui.webcam_dsc)
+    );
+
+    memset(
+        &s_ui.webcam_rgb_dsc,
+        0,
+        sizeof(s_ui.webcam_rgb_dsc)
+    );
+
+    render_webcam_model();
+}
+
+
+static void create_filament_page(lv_obj_t *page)
+{
+    /*
+     * DT_FILAMENT_FULL_PANE
+     *
+     * No page heading and no status strapline -- the filament system card
+     * is the whole page. create_page_heading() was what established the
+     * page's flex layout, so that setup moves here.
+     */
+    lv_obj_set_layout(page, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(page, 7, 0);
 
     lv_obj_t *card =
         make_card(
@@ -3054,7 +5725,6 @@ static void create_filament_page(lv_obj_t *page)
 
     render_filament_model();
 
-    ESP_LOGI(TAG, "FILAMENT_BUILD complete");
 }
 
 
@@ -3188,14 +5858,157 @@ static void create_files_page(lv_obj_t *page)
 
     s_ui.file_detail_text = lv_obj_get_child(details, 1);
 
+    /*
+     * DT_FILE_THUMBNAIL_PREVIEW
+     * Details scrolls vertically to accommodate a 300x300 selected preview.
+     */
+    lv_obj_set_width(
+        s_ui.file_panels[1],
+        LV_PCT(100)
+    );
+
+    lv_obj_add_flag(
+        s_ui.file_panels[1],
+        LV_OBJ_FLAG_SCROLLABLE
+    );
+
+    lv_obj_set_scroll_dir(
+        s_ui.file_panels[1],
+        LV_DIR_VER
+    );
+
+    lv_obj_set_scrollbar_mode(
+        s_ui.file_panels[1],
+        LV_SCROLLBAR_MODE_AUTO
+    );
+
+    /* DT_FILE_THUMBNAIL_DISPLAY_FIX_V1 */
+    lv_obj_set_width(
+        details,
+        LV_PCT(100)
+    );
+
+    lv_obj_set_height(
+        details,
+        LV_SIZE_CONTENT
+    );
+
+    lv_obj_set_flex_grow(
+        details,
+        0
+    );
+
+    /*
+     * DT_FILE_DETAILS_TWO_COLUMN
+     *
+     * Metadata text on the left, thumbnail on the right, as a plain flex
+     * row -- there's no bordered "table" widget in this codebase, and an
+     * unstyled flex row gives the two-column look with no lines drawn.
+     * The text column is content-sized (see DT_FILE_DETAILS_AUTO_WIDTH_TEXT
+     * below) so it's only ever as wide as its longest line, and the text
+     * keeps its own LV_LABEL_LONG_MODE_WRAP as a safety net rather than
+     * spanning (and visually splitting across) the full card width like
+     * it did before.
+     */
+    lv_obj_t *detail_row = lv_obj_create(details);
+    lv_obj_remove_style_all(detail_row);
+    lv_obj_set_width(detail_row, LV_PCT(100));
+    lv_obj_set_height(detail_row, LV_SIZE_CONTENT);
+    lv_obj_set_layout(detail_row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(detail_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(detail_row, 12, 0);
+    lv_obj_set_flex_align(
+        detail_row,
+        LV_FLEX_ALIGN_START,
+        LV_FLEX_ALIGN_CENTER,
+        LV_FLEX_ALIGN_CENTER
+    );
+
+    lv_obj_set_parent(s_ui.file_detail_text, detail_row);
+
     lv_label_set_long_mode(
         s_ui.file_detail_text,
         LV_LABEL_LONG_MODE_WRAP
     );
 
-    lv_obj_set_width(
-        s_ui.file_detail_text,
-        LV_PCT(100)
+    /*
+     * DT_FILE_DETAILS_AUTO_WIDTH_TEXT
+     *
+     * Content-sized, not a fixed or growing width: the box sizes itself
+     * to whichever line the metadata renders widest, so ordinary lines
+     * never wrap and the box never carries unused blank space either.
+     * LV_LABEL_LONG_MODE_WRAP stays set purely as a safety net for one
+     * pathologically long unbroken line -- it won't fire for normal
+     * metadata since the box already fits every real line.
+     */
+    lv_obj_set_width(s_ui.file_detail_text, LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(s_ui.file_detail_text, 0);
+
+    s_ui.file_thumbnail_row =
+        lv_obj_create(detail_row);
+
+    lv_obj_remove_style_all(
+        s_ui.file_thumbnail_row
+    );
+
+    /*
+     * DT_FILE_DETAILS_AUTO_WIDTH_TEXT
+     *
+     * This column now grows to claim whatever width the auto-sized text
+     * column doesn't need, and centers the fixed 150px image inside
+     * itself -- so the image gets equal left/right padding rather than
+     * sitting flush against either the text or the card's edge.
+     */
+    lv_obj_set_width(s_ui.file_thumbnail_row, 0);
+    lv_obj_set_height(s_ui.file_thumbnail_row, 154);
+    lv_obj_set_flex_grow(s_ui.file_thumbnail_row, 1);
+
+    lv_obj_set_layout(
+        s_ui.file_thumbnail_row,
+        LV_LAYOUT_FLEX
+    );
+
+    lv_obj_set_flex_flow(
+        s_ui.file_thumbnail_row,
+        LV_FLEX_FLOW_ROW
+    );
+
+    lv_obj_set_flex_align(
+        s_ui.file_thumbnail_row,
+        LV_FLEX_ALIGN_CENTER,
+        LV_FLEX_ALIGN_CENTER,
+        LV_FLEX_ALIGN_CENTER
+    );
+
+    s_ui.file_thumbnail_image =
+        lv_image_create(
+            s_ui.file_thumbnail_row
+        );
+
+    /*
+     * DT_FILE_THUMBNAIL_150_PREVIEW
+     * Fixed display box. Source can be smaller; LVGL scales it after decode.
+     */
+    lv_obj_set_size(
+        s_ui.file_thumbnail_image,
+        150,
+        150
+    );
+
+    lv_image_set_antialias(
+        s_ui.file_thumbnail_image,
+        true
+    );
+
+    lv_obj_add_flag(
+        s_ui.file_thumbnail_row,
+        LV_OBJ_FLAG_HIDDEN
+    );
+
+    memset(
+        &s_ui.file_thumbnail_dsc,
+        0,
+        sizeof(s_ui.file_thumbnail_dsc)
     );
 
     s_ui.file_start_button =
@@ -3240,51 +6053,41 @@ static void create_files_page(lv_obj_t *page)
 
 
 
-static void log_ui_heap(
-    const char *phase,
-    dt_ui_page_t page
-)
-{
-    const size_t internal_free =
-        heap_caps_get_free_size(
-            MALLOC_CAP_INTERNAL |
-            MALLOC_CAP_8BIT
-        );
-
-    const size_t internal_largest =
-        heap_caps_get_largest_free_block(
-            MALLOC_CAP_INTERNAL |
-            MALLOC_CAP_8BIT
-        );
-
-    const size_t psram_free =
-        heap_caps_get_free_size(
-            MALLOC_CAP_SPIRAM |
-            MALLOC_CAP_8BIT
-        );
-
-    ESP_LOGI(
-        TAG,
-        "UI_HEAP %s page=%d internal=%u largest=%u psram=%u",
-        phase,
-        (int)page,
-        (unsigned)internal_free,
-        (unsigned)internal_largest,
-        (unsigned)psram_free
-    );
-}
-
-
 static void clear_recycled_page_refs(
     dt_ui_page_t page
 )
 {
+    if (page == DT_UI_PAGE_HOME) {
+        s_ui.quick_home_button = NULL;
+        s_ui.quick_clean_nozzle_button = NULL;
+        s_ui.quick_macro2_button = NULL;
+        return;
+    }
+
     if (page != DT_UI_PAGE_CONTROL) {
         return;
     }
 
     s_ui.home_button = NULL;
+
+    /* DT_MOVE_STEP / DT_Z_TILT */
+    s_ui.z_tilt_button = NULL;
+
+    for (size_t i = 0; i < DT_MOVE_STEP_COUNT; ++i) {
+        s_ui.move_step_boxes[i] = NULL;
+        s_ui.extrude_step_boxes[i] = NULL;
+    }
+
+    for (size_t i = 0; i < DT_EXTRUDE_SPEED_COUNT; ++i) {
+        s_ui.extrude_speed_boxes[i] = NULL;
+    }
     s_ui.heat_button = NULL;
+
+    /* DT_TEMP_ENTRY (the keypad itself lives on the screen, not a page) */
+    s_ui.nozzle_set_button = NULL;
+    s_ui.nozzle_cooldown_button = NULL;
+    s_ui.bed_set_button = NULL;
+    s_ui.bed_cooldown_button = NULL;
     s_ui.extrude_button = NULL;
     s_ui.retract_button = NULL;
 
@@ -3292,6 +6095,44 @@ static void clear_recycled_page_refs(
     s_ui.nozzle_control_text = NULL;
     s_ui.bed_control_text = NULL;
     s_ui.fan_control_text = NULL;
+
+    s_ui.aux_manual_count = 0;
+
+    for (
+        size_t row = 0;
+        row < 4;
+        ++row
+    ) {
+        s_ui.aux_manual_rows[row] = NULL;
+        s_ui.aux_manual_labels[row] = NULL;
+        s_ui.aux_manual_slots[row] =
+            DT_UI_AUX_FAN_MAX;
+
+        s_ui.aux_manual_sliders[row] = NULL;
+        s_ui.aux_manual_names[row][0] = '\0';
+        s_ui.aux_manual_dragging[row] = false;
+    }
+
+    for (
+        size_t i = 0;
+        i < DT_UI_AUX_FAN_MAX;
+        ++i
+    ) {
+        s_ui.aux_fan_cards[i] = NULL;
+        s_ui.aux_fan_title[i] = NULL;
+        s_ui.aux_fan_status[i] = NULL;
+        s_ui.aux_fan_rows[i] = NULL;
+
+        for (
+            size_t preset = 0;
+            preset <
+                DT_UI_AUX_FAN_PRESET_COUNT;
+            ++preset
+        ) {
+            s_ui.aux_fan_buttons[i][preset] =
+                NULL;
+        }
+    }
 
     for (size_t i = 0; i < 6; ++i) {
         s_ui.jog_buttons[i] = NULL;
@@ -3332,11 +6173,6 @@ static void recycle_secondary_pages(
             continue;
         }
 
-        log_ui_heap(
-            "before-clean",
-            page
-        );
-
         lv_obj_clean(
             s_ui.pages[page]
         );
@@ -3354,6 +6190,14 @@ static void recycle_secondary_pages(
             s_ui.file_next_button = NULL;
             s_ui.file_detail_text = NULL;
             s_ui.file_start_button = NULL;
+            s_ui.file_thumbnail_row = NULL;
+            s_ui.file_thumbnail_image = NULL;
+
+            memset(
+                &s_ui.file_thumbnail_dsc,
+                0,
+                sizeof(s_ui.file_thumbnail_dsc)
+            );
 
             for (size_t file_i = 0; file_i < DT_UI_FILE_ENTRY_MAX; ++file_i) {
                 s_ui.file_entry_buttons[file_i] = NULL;
@@ -3402,6 +6246,43 @@ static void recycle_secondary_pages(
             s_ui.devices_filament_text = NULL;
         }
 
+        if (page == DT_UI_PAGE_WEBCAM) {
+            /* DT_WEBCAM_SNAPSHOT */
+            s_ui.webcam_status_text = NULL;
+            s_ui.webcam_image_wrap = NULL;
+            s_ui.webcam_image = NULL;
+
+            /*
+             * DT_WEBCAM_HOME_PANE
+             *
+             * The decoded frame is deliberately NOT freed here. Home is
+             * resident and its webcam pane draws this same buffer, so
+             * releasing it with the webcam page would leave that pane
+             * pointing at freed memory.
+             *
+             * DT_WEBCAM_PRESCALE
+             *
+             * This page's pre-scaled copy IS freed: its widget has just been
+             * destroyed, nothing else draws it, and at pane size it is the
+             * larger of the two. It is rebuilt on the next visit.
+             */
+            lv_image_cache_drop(&s_ui.webcam_view_page.dsc);
+
+            free(s_ui.webcam_view_page.data);
+
+            memset(
+                &s_ui.webcam_view_page,
+                0,
+                sizeof(s_ui.webcam_view_page)
+            );
+
+            memset(
+                &s_ui.webcam_dsc,
+                0,
+                sizeof(s_ui.webcam_dsc)
+            );
+        }
+
         if (page == DT_UI_PAGE_SETTINGS) {
             s_ui.settings_build_text = NULL;
             s_ui.settings_memory_text = NULL;
@@ -3414,10 +6295,6 @@ static void recycle_secondary_pages(
         s_ui.page_built[page] =
             false;
 
-        log_ui_heap(
-            "after-clean",
-            page
-        );
     }
 }
 
@@ -3434,19 +6311,6 @@ static void ensure_page_built(dt_ui_page_t page)
     if (s_ui.page_built[page]) {
         return;
     }
-
-    const int64_t started_us = esp_timer_get_time();
-
-    log_ui_heap(
-        "before-build",
-        page
-    );
-
-    ESP_LOGI(
-        TAG,
-        "lazy build page=%d start",
-        (int)page
-    );
 
     switch (page) {
     case DT_UI_PAGE_HOME:
@@ -3479,6 +6343,12 @@ static void ensure_page_built(dt_ui_page_t page)
         );
         break;
 
+    case DT_UI_PAGE_WEBCAM:
+        create_webcam_page(
+            s_ui.pages[DT_UI_PAGE_WEBCAM]
+        );
+        break;
+
     case DT_UI_PAGE_SETTINGS:
         create_settings_page(
             s_ui.pages[DT_UI_PAGE_SETTINGS]
@@ -3491,22 +6361,6 @@ static void ensure_page_built(dt_ui_page_t page)
 
     s_ui.page_built[page] = true;
 
-    ESP_LOGI(
-        TAG,
-        "lazy build page=%d complete in %lld ms",
-        (int)page,
-        (long long)(
-            (
-                esp_timer_get_time() -
-                started_us
-            ) / 1000
-        )
-    );
-
-    log_ui_heap(
-        "after-build",
-        page
-    );
 }
 
 static void create_pages(lv_obj_t *content)
@@ -3540,6 +6394,374 @@ static void create_pages(lv_obj_t *content)
 
 static void create_dialog_overlay(void)
 {
+    /*
+     * DT_TOAST
+     *
+     * Bottom-right, floating over the page area. Not interactive -- it must
+     * never swallow a tap meant for whatever is underneath it.
+     */
+    s_ui.toast_panel = lv_obj_create(s_ui.screen);
+    lv_obj_remove_style_all(s_ui.toast_panel);
+    lv_obj_add_flag(s_ui.toast_panel, LV_OBJ_FLAG_FLOATING);
+    lv_obj_remove_flag(s_ui.toast_panel, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(s_ui.toast_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(s_ui.toast_panel, 380, 46);
+    lv_obj_align(s_ui.toast_panel, LV_ALIGN_BOTTOM_RIGHT, -14, -14);
+    lv_obj_set_style_bg_color(s_ui.toast_panel, color(DT_COLOR_SURFACE_2), 0);
+    lv_obj_set_style_bg_opa(s_ui.toast_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_ui.toast_panel, 8, 0);
+    lv_obj_set_style_pad_hor(s_ui.toast_panel, 12, 0);
+    lv_obj_set_style_border_width(s_ui.toast_panel, 3, 0);
+    lv_obj_set_style_border_side(s_ui.toast_panel, LV_BORDER_SIDE_LEFT, 0);
+    lv_obj_set_style_border_color(s_ui.toast_panel, color(DT_COLOR_MUTED), 0);
+    lv_obj_add_flag(s_ui.toast_panel, LV_OBJ_FLAG_HIDDEN);
+
+    s_ui.toast_label =
+        make_label(s_ui.toast_panel, "", DT_COLOR_TEXT);
+
+    lv_label_set_long_mode(s_ui.toast_label, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_width(s_ui.toast_label, LV_PCT(100));
+    lv_obj_align(s_ui.toast_label, LV_ALIGN_LEFT_MID, 0, 0);
+
+    s_ui.toast_timer =
+        lv_timer_create(toast_timer_cb, 3000, NULL);
+
+    lv_timer_pause(s_ui.toast_timer);
+
+    /*
+     * DT_PRINTER_LIST
+     *
+     * Picker for the saved Moonraker instances, opened from the header
+     * hostname. Lives on the screen, so page recycling never touches it.
+     */
+    s_ui.printer_scrim = lv_obj_create(s_ui.screen);
+    lv_obj_remove_style_all(s_ui.printer_scrim);
+    lv_obj_add_flag(s_ui.printer_scrim, LV_OBJ_FLAG_FLOATING);
+    lv_obj_set_size(s_ui.printer_scrim, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(s_ui.printer_scrim, color(0x000000), 0);
+    lv_obj_set_style_bg_opa(s_ui.printer_scrim, LV_OPA_70, 0);
+    lv_obj_add_flag(s_ui.printer_scrim, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *printer_panel = lv_obj_create(s_ui.printer_scrim);
+    style_surface(printer_panel);
+    lv_obj_set_size(printer_panel, 460, 400);
+    lv_obj_center(printer_panel);
+    lv_obj_set_layout(printer_panel, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(printer_panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(printer_panel, 18, 0);
+    lv_obj_set_style_pad_row(printer_panel, 8, 0);
+
+    lv_obj_t *printer_title =
+        make_label(printer_panel, "Printer", DT_COLOR_TEXT);
+
+    lv_obj_set_style_text_font(
+        printer_title,
+        &lv_font_montserrat_20,
+        0
+    );
+
+    make_label(
+        printer_panel,
+        "Switching reconnects without restarting.",
+        DT_COLOR_MUTED
+    );
+
+    s_ui.printer_list = lv_obj_create(printer_panel);
+    lv_obj_remove_style_all(s_ui.printer_list);
+    lv_obj_set_width(s_ui.printer_list, LV_PCT(100));
+    lv_obj_set_flex_grow(s_ui.printer_list, 1);
+    lv_obj_set_layout(s_ui.printer_list, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(s_ui.printer_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_ui.printer_list, 6, 0);
+    lv_obj_set_scroll_dir(s_ui.printer_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_ui.printer_list, LV_SCROLLBAR_MODE_AUTO);
+
+    /*
+     * All rows are built now and shown or hidden as the model changes --
+     * rebuilding the list on every update would churn LVGL objects for no
+     * benefit at this size.
+     */
+    for (size_t i = 0; i < DT_UI_PRINTER_MAX; ++i) {
+        s_ui.printer_rows[i] = lv_obj_create(s_ui.printer_list);
+        lv_obj_remove_style_all(s_ui.printer_rows[i]);
+        lv_obj_set_width(s_ui.printer_rows[i], LV_PCT(100));
+        lv_obj_set_height(s_ui.printer_rows[i], 40);
+        lv_obj_set_layout(s_ui.printer_rows[i], LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(s_ui.printer_rows[i], LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_column(s_ui.printer_rows[i], 6, 0);
+        lv_obj_remove_flag(s_ui.printer_rows[i], LV_OBJ_FLAG_SCROLLABLE);
+
+        s_ui.printer_entry_buttons[i] =
+            make_action(s_ui.printer_rows[i], "", false);
+
+        lv_obj_set_flex_grow(s_ui.printer_entry_buttons[i], 1);
+        lv_obj_set_height(s_ui.printer_entry_buttons[i], 40);
+
+        lv_obj_add_event_cb(
+            s_ui.printer_entry_buttons[i],
+            printer_select_event,
+            LV_EVENT_CLICKED,
+            (void *)(intptr_t)i
+        );
+
+        s_ui.printer_delete_buttons[i] =
+            make_action(s_ui.printer_rows[i], "Forget", false);
+
+        lv_obj_set_flex_grow(s_ui.printer_delete_buttons[i], 0);
+        lv_obj_set_width(s_ui.printer_delete_buttons[i], 88);
+        lv_obj_set_height(s_ui.printer_delete_buttons[i], 40);
+        style_destructive_action(s_ui.printer_delete_buttons[i]);
+
+        lv_obj_add_event_cb(
+            s_ui.printer_delete_buttons[i],
+            printer_delete_event,
+            LV_EVENT_CLICKED,
+            (void *)(intptr_t)i
+        );
+
+        lv_obj_add_flag(
+            s_ui.printer_rows[i],
+            LV_OBJ_FLAG_HIDDEN
+        );
+    }
+
+    lv_obj_t *printer_actions = lv_obj_create(printer_panel);
+    lv_obj_remove_style_all(printer_actions);
+    lv_obj_set_size(printer_actions, LV_PCT(100), 42);
+    lv_obj_set_layout(printer_actions, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(printer_actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(printer_actions, 8, 0);
+
+    lv_obj_add_event_cb(
+        make_action(printer_actions, "Close", false),
+        printer_close_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    s_ui.printer_add_button =
+        make_action(printer_actions, "Add printer", true);
+
+    lv_obj_add_event_cb(
+        s_ui.printer_add_button,
+        host_open_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    /*
+     * DT_PRINTER_LIST
+     *
+     * Hostname entry. A hostname beats an IP here -- it survives DHCP
+     * churn -- so this is a text field rather than a numeric pad.
+     */
+    s_ui.host_scrim = lv_obj_create(s_ui.screen);
+    lv_obj_remove_style_all(s_ui.host_scrim);
+    lv_obj_add_flag(s_ui.host_scrim, LV_OBJ_FLAG_FLOATING);
+    lv_obj_set_size(s_ui.host_scrim, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(s_ui.host_scrim, color(0x000000), 0);
+    lv_obj_set_style_bg_opa(s_ui.host_scrim, LV_OPA_70, 0);
+    lv_obj_add_flag(s_ui.host_scrim, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *host_panel = lv_obj_create(s_ui.host_scrim);
+    style_surface(host_panel);
+    lv_obj_set_size(host_panel, 660, 448);
+    lv_obj_center(host_panel);
+    lv_obj_set_layout(host_panel, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(host_panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(host_panel, 14, 0);
+    lv_obj_set_style_pad_row(host_panel, 8, 0);
+
+    make_label(
+        host_panel,
+        "Hostname or IP  (port defaults to 7125)",
+        DT_COLOR_MUTED
+    );
+
+    s_ui.host_textarea = lv_textarea_create(host_panel);
+    lv_textarea_set_one_line(s_ui.host_textarea, true);
+    lv_textarea_set_placeholder_text(
+        s_ui.host_textarea,
+        "printer.local"
+    );
+    lv_obj_set_width(s_ui.host_textarea, LV_PCT(100));
+
+    lv_obj_add_event_cb(
+        s_ui.host_textarea,
+        host_field_focus_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    /*
+     * Port and key share a row: both are usually left alone, so they get
+     * placeholders rather than labels and no vertical space of their own.
+     */
+    lv_obj_t *host_extra = lv_obj_create(host_panel);
+    lv_obj_remove_style_all(host_extra);
+    lv_obj_set_width(host_extra, LV_PCT(100));
+    lv_obj_set_height(host_extra, 40);
+    lv_obj_set_layout(host_extra, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(host_extra, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(host_extra, 8, 0);
+    lv_obj_remove_flag(host_extra, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_ui.port_textarea = lv_textarea_create(host_extra);
+    lv_textarea_set_one_line(s_ui.port_textarea, true);
+    lv_textarea_set_placeholder_text(s_ui.port_textarea, "7125");
+    lv_textarea_set_accepted_chars(s_ui.port_textarea, "0123456789");
+    lv_textarea_set_max_length(s_ui.port_textarea, 5);
+    lv_obj_set_width(s_ui.port_textarea, 130);
+    lv_obj_set_flex_grow(s_ui.port_textarea, 0);
+
+    lv_obj_add_event_cb(
+        s_ui.port_textarea,
+        host_field_focus_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    s_ui.api_key_textarea = lv_textarea_create(host_extra);
+    lv_textarea_set_one_line(s_ui.api_key_textarea, true);
+    lv_textarea_set_placeholder_text(
+        s_ui.api_key_textarea,
+        "API key (optional)"
+    );
+    lv_textarea_set_max_length(s_ui.api_key_textarea, 64);
+    lv_obj_set_flex_grow(s_ui.api_key_textarea, 1);
+
+    lv_obj_add_event_cb(
+        s_ui.api_key_textarea,
+        host_field_focus_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    lv_obj_t *host_actions = lv_obj_create(host_panel);
+    lv_obj_remove_style_all(host_actions);
+    lv_obj_set_size(host_actions, LV_PCT(100), 42);
+    lv_obj_set_layout(host_actions, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(host_actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(host_actions, 8, 0);
+
+    lv_obj_add_event_cb(
+        make_action(host_actions, "Cancel", false),
+        host_close_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    lv_obj_add_event_cb(
+        make_action(host_actions, "Save", true),
+        host_confirm_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    s_ui.host_keyboard = lv_keyboard_create(host_panel);
+    lv_obj_set_width(s_ui.host_keyboard, LV_PCT(100));
+    lv_obj_set_flex_grow(s_ui.host_keyboard, 1);
+    lv_keyboard_set_mode(s_ui.host_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_keyboard_set_textarea(s_ui.host_keyboard, s_ui.host_textarea);
+
+    /*
+     * DT_TEMP_ENTRY
+     *
+     * A dedicated numeric pad rather than a textarea + lv_keyboard: this
+     * only ever takes three digits, and big keys beat a full keyboard on a
+     * printer touchscreen. Lives on the screen, not on a page, so it is
+     * never touched by page recycling.
+     */
+    s_ui.keypad_scrim = lv_obj_create(s_ui.screen);
+    lv_obj_remove_style_all(s_ui.keypad_scrim);
+    lv_obj_add_flag(s_ui.keypad_scrim, LV_OBJ_FLAG_FLOATING);
+    lv_obj_set_size(s_ui.keypad_scrim, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(s_ui.keypad_scrim, color(0x000000), 0);
+    lv_obj_set_style_bg_opa(s_ui.keypad_scrim, LV_OPA_70, 0);
+    lv_obj_add_flag(s_ui.keypad_scrim, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *keypad = lv_obj_create(s_ui.keypad_scrim);
+    style_surface(keypad);
+    lv_obj_set_size(keypad, 300, 386);
+    lv_obj_center(keypad);
+    lv_obj_set_layout(keypad, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(keypad, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(keypad, 16, 0);
+    lv_obj_set_style_pad_row(keypad, 10, 0);
+    lv_obj_remove_flag(keypad, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_ui.keypad_title =
+        make_label(keypad, "Nozzle target", DT_COLOR_MUTED);
+
+    s_ui.keypad_value =
+        make_label(keypad, "0 °C", DT_COLOR_TEXT);
+
+    lv_obj_set_style_text_font(s_ui.keypad_value, &lv_font_montserrat_20, 0);
+    lv_obj_set_width(s_ui.keypad_value, LV_PCT(100));
+    lv_obj_set_style_text_align(s_ui.keypad_value, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *pad = lv_obj_create(keypad);
+    lv_obj_remove_style_all(pad);
+    lv_obj_set_width(pad, LV_PCT(100));
+    lv_obj_set_flex_grow(pad, 1);
+    lv_obj_set_layout(pad, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(pad, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_row(pad, 6, 0);
+    lv_obj_set_style_pad_column(pad, 6, 0);
+    lv_obj_remove_flag(pad, LV_OBJ_FLAG_SCROLLABLE);
+
+    static const char *keypad_keys[] = {
+        "1", "2", "3",
+        "4", "5", "6",
+        "7", "8", "9",
+        "Clear", "0", "Del"
+    };
+
+    for (size_t i = 0; i < 12; ++i) {
+        lv_obj_t *key =
+            make_action(pad, keypad_keys[i], false);
+
+        /* make_action() grows to fill a row; these are a fixed grid. */
+        lv_obj_set_flex_grow(key, 0);
+        lv_obj_set_size(key, 80, 46);
+
+        if (i == 9) {
+            lv_obj_add_event_cb(
+                key, keypad_clear_event, LV_EVENT_CLICKED, NULL);
+        } else if (i == 11) {
+            lv_obj_add_event_cb(
+                key, keypad_delete_event, LV_EVENT_CLICKED, NULL);
+        } else {
+            lv_obj_add_event_cb(
+                key,
+                keypad_digit_event,
+                LV_EVENT_CLICKED,
+                (void *)(uintptr_t)keypad_keys[i][0]
+            );
+        }
+    }
+
+    lv_obj_t *keypad_actions = lv_obj_create(keypad);
+    lv_obj_remove_style_all(keypad_actions);
+    lv_obj_set_size(keypad_actions, LV_PCT(100), 42);
+    lv_obj_set_layout(keypad_actions, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(keypad_actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(keypad_actions, 8, 0);
+
+    lv_obj_add_event_cb(
+        make_action(keypad_actions, "Cancel", false),
+        keypad_close_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    lv_obj_add_event_cb(
+        make_action(keypad_actions, "Set", true),
+        keypad_confirm_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
     s_ui.dialog_scrim = lv_obj_create(s_ui.screen);
     lv_obj_remove_style_all(s_ui.dialog_scrim);
     lv_obj_add_flag(s_ui.dialog_scrim, LV_OBJ_FLAG_FLOATING);
@@ -3597,6 +6819,7 @@ static void create_shell(lv_display_t *display)
         DT_NAV_ICON_FILES,
         DT_NAV_ICON_FILAMENT,
         DT_NAV_ICON_DEVICES,
+        DT_NAV_ICON_WEBCAM,
         DT_NAV_ICON_SETTINGS,
     };
 
@@ -3664,6 +6887,27 @@ static void create_shell(lv_display_t *display)
     lv_obj_set_style_text_font(brand, &lv_font_montserrat_20, 0);
     lv_obj_align(brand, LV_ALIGN_LEFT_MID, 0, 0);
 
+    /*
+     * DT_ESTOP
+     *
+     * Deliberately immediate and unconfirmed -- a stop that first asks
+     * "are you sure?" is not an emergency stop. Left enabled regardless
+     * of connection state too: a greyed-out e-stop is worse than one that
+     * tries and reports a failure.
+     */
+    s_ui.estop_button =
+        make_action(header, "E-STOP", true);
+
+    lv_obj_set_size(s_ui.estop_button, 96, 36);
+    lv_obj_align(s_ui.estop_button, LV_ALIGN_LEFT_MID, 152, 0);
+
+    lv_obj_add_event_cb(
+        s_ui.estop_button,
+        direct_action_event,
+        LV_EVENT_CLICKED,
+        (void *)(uintptr_t)DT_UI_ACTION_EMERGENCY_STOP
+    );
+
     s_ui.connection_dot = lv_obj_create(header);
     lv_obj_remove_style_all(s_ui.connection_dot);
     lv_obj_set_size(s_ui.connection_dot, 9, 9);
@@ -3680,6 +6924,20 @@ static void create_shell(lv_display_t *display)
     lv_label_set_long_mode(s_ui.device_name, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_style_text_align(s_ui.device_name, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_align(s_ui.device_name, LV_ALIGN_RIGHT_MID, 0, 0);
+
+    /* DT_PRINTER_LIST: the hostname is the way into the picker. */
+    lv_obj_add_flag(s_ui.device_name, LV_OBJ_FLAG_CLICKABLE);
+
+    /* A one-line label is a thin target on a 7" panel -- grow the hit box
+     * without disturbing the header's alignment. */
+    lv_obj_set_ext_click_area(s_ui.device_name, 14);
+
+    lv_obj_add_event_cb(
+        s_ui.device_name,
+        printer_open_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
 
     lv_obj_t *content = lv_obj_create(body);
     lv_obj_remove_style_all(content);
@@ -3773,24 +7031,6 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
             : "No printer"
     );
 
-    const bool has_device =
-        model->device_name != NULL &&
-        model->device_name[0] != '\0';
-
-    lv_label_set_text(
-        s_ui.printer_name,
-        has_device
-            ? model->device_name
-            : "No paired printer"
-    );
-
-    lv_label_set_text(
-        s_ui.printer_hint,
-        has_device
-            ? "Selected same-LAN printer"
-            : "Pair a same-LAN device to begin."
-    );
-
     const char *connection = "Offline";
     uint32_t connection_color =
         DT_COLOR_MUTED;
@@ -3810,6 +7050,15 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
         connection = "Online";
         connection_color =
             DT_COLOR_SUCCESS;
+
+    } else if (
+        model->connection ==
+        DT_UI_CONNECTION_ERROR
+    ) {
+        /* DT_KLIPPER_ERROR: halted, not connecting. */
+        connection = "Klipper error";
+        connection_color =
+            DT_COLOR_ACCENT;
     }
 
     lv_label_set_text(
@@ -3823,30 +7072,48 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
         0
     );
 
+    /*
+     * DT_KLIPPER_ERROR
+     *
+     * When Klipper is halted there is no job to describe, so the card
+     * carries the reason instead -- otherwise the only clue on screen is a
+     * header pill, and the actual fault text lives in a log nobody can read
+     * from here.
+     */
+    const bool klipper_halted =
+        model->connection == DT_UI_CONNECTION_ERROR;
+
     lv_label_set_text(
         s_ui.job_state,
-        job_state_text(
-            model->job_state
-        )
+        klipper_halted
+            ? "Klipper halted"
+            : job_state_text(model->job_state)
     );
 
     lv_obj_set_style_text_color(
         s_ui.job_state,
         color(
-            model->job_state ==
-                DT_UI_JOB_ERROR
-                ? DT_COLOR_WARNING
-                : DT_COLOR_TEXT
+            klipper_halted
+                ? DT_COLOR_ACCENT
+                : (model->job_state == DT_UI_JOB_ERROR
+                    ? DT_COLOR_WARNING
+                    : DT_COLOR_TEXT)
         ),
         0
     );
 
+    const bool has_status_message =
+        model->status_message != NULL &&
+        model->status_message[0] != '\0';
+
     lv_label_set_text(
         s_ui.filename,
-        model->filename != NULL &&
-        model->filename[0] != '\0'
-            ? model->filename
-            : "No active file"
+        klipper_halted && has_status_message
+            ? model->status_message
+            : (model->filename != NULL &&
+               model->filename[0] != '\0'
+                ? model->filename
+                : "No active file")
     );
 
     uint8_t progress =
@@ -3868,7 +7135,6 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
 
     char elapsed[20];
     char remaining[20];
-    char time_line[64];
 
     format_duration(
         elapsed,
@@ -3882,17 +7148,16 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
         model->remaining_seconds
     );
 
-    snprintf(
-        time_line,
-        sizeof(time_line),
-        "Elapsed %s  •  Remaining %s",
-        elapsed,
-        remaining
+    lv_label_set_text_fmt(
+        s_ui.elapsed_text,
+        "Elapsed  %s",
+        elapsed
     );
 
-    lv_label_set_text(
-        s_ui.time_text,
-        time_line
+    lv_label_set_text_fmt(
+        s_ui.remaining_text,
+        "Remaining  %s",
+        remaining
     );
 
     char temperature[48];
@@ -3965,27 +7230,39 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
             );
         }
 
-        if (model->fan_percent <= 100) {
+        /*
+         * DT_CHAMBER_TEMP
+         *
+         * No target to show for a plain temperature_sensor, so this is the
+         * current reading alone rather than the "current / target" form.
+         */
+        if (isfinite(model->chamber_c)) {
+            int tenths =
+                (int)(model->chamber_c * 10.0f +
+                      (model->chamber_c >= 0.0f ? 0.5f : -0.5f));
+
             lv_label_set_text_fmt(
-                s_ui.fan_text,
-                "%u%%",
-                model->fan_percent
+                s_ui.chamber_text,
+                "%d.%d °C",
+                tenths / 10,
+                tenths < 0 ? -(tenths % 10) : tenths % 10
             );
-
-            if (
-                s_ui.fan_control_text != NULL
-            ) {
-                lv_label_set_text_fmt(
-                    s_ui.fan_control_text,
-                    "%u%%",
-                    model->fan_percent
-                );
-            }
-
         } else {
             lv_label_set_text(
-                s_ui.fan_text,
+                s_ui.chamber_text,
                 "Unavailable"
+            );
+        }
+
+        /* The part fan reading lives on the fan page now, not on home. */
+        if (
+            s_ui.fan_control_text != NULL &&
+            model->fan_percent <= 100
+        ) {
+            lv_label_set_text_fmt(
+                s_ui.fan_control_text,
+                "%u%%",
+                model->fan_percent
             );
         }
 
@@ -4001,7 +7278,7 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
         );
 
         lv_label_set_text(
-            s_ui.fan_text,
+            s_ui.chamber_text,
             "Unavailable"
         );
     }
@@ -4064,6 +7341,35 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
         );
     }
 
+    /* DT_Z_TILT */
+    if (s_ui.z_tilt_button != NULL) {
+        set_button_enabled(
+            s_ui.z_tilt_button,
+            model->can_home
+        );
+    }
+
+    if (s_ui.quick_home_button != NULL) {
+        set_button_enabled(
+            s_ui.quick_home_button,
+            model->can_home
+        );
+    }
+
+    if (s_ui.quick_clean_nozzle_button != NULL) {
+        set_button_enabled(
+            s_ui.quick_clean_nozzle_button,
+            model->can_home
+        );
+    }
+
+    if (s_ui.quick_macro2_button != NULL) {
+        set_button_enabled(
+            s_ui.quick_macro2_button,
+            model->can_home
+        );
+    }
+
     for (size_t i = 0; i < 6; ++i) {
         if (s_ui.jog_buttons[i] != NULL) {
             set_button_enabled(
@@ -4078,6 +7384,27 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
             s_ui.heat_button,
             model->can_heat
         );
+    }
+
+    /* DT_TEMP_ENTRY */
+    lv_obj_t *const heater_buttons[] = {
+        s_ui.nozzle_set_button,
+        s_ui.nozzle_cooldown_button,
+        s_ui.bed_set_button,
+        s_ui.bed_cooldown_button,
+    };
+
+    for (
+        size_t i = 0;
+        i < sizeof(heater_buttons) / sizeof(heater_buttons[0]);
+        ++i
+    ) {
+        if (heater_buttons[i] != NULL) {
+            set_button_enabled(
+                heater_buttons[i],
+                model->can_heat
+            );
+        }
     }
 
     for (size_t i = 0; i < 3; ++i) {
@@ -4109,6 +7436,8 @@ esp_err_t dt_ui_update(const dt_ui_model_t *model)
             model->can_extrude
         );
     }
+
+    render_aux_fans(model);
 
     return ESP_OK;
 }
@@ -4181,6 +7510,149 @@ esp_err_t dt_ui_update_files(
     if (s_ui.page_built[DT_UI_PAGE_FILES]) {
         render_files_model();
     }
+
+    return ESP_OK;
+}
+
+
+esp_err_t dt_ui_update_webcam(
+    const dt_ui_webcam_model_t *model
+)
+{
+    if (!s_ui.ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (model == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_ui.webcam_model = *model;
+
+    /*
+     * DT_WEBCAM_HOME_PANE
+     *
+     * No page_built gate here any more. Two pages can host a view of the
+     * frame, and gating on the webcam page meant the home pane was never
+     * rendered at all -- the decode simply never ran while sitting on
+     * home. render_webcam_model() checks for itself whether either view
+     * actually exists, so that is the single place the decision is made.
+     */
+    render_webcam_model();
+
+    return ESP_OK;
+}
+
+
+/* DT_TOAST */
+esp_err_t dt_ui_toast(
+    dt_ui_toast_kind_t kind,
+    const char *text
+)
+{
+    if (!s_ui.ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (
+        s_ui.toast_panel == NULL ||
+        s_ui.toast_label == NULL ||
+        text == NULL
+    ) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint32_t accent = DT_COLOR_MUTED;
+    uint32_t linger_ms = 3000;
+
+    if (kind == DT_UI_TOAST_SUCCESS) {
+        accent = DT_COLOR_SUCCESS;
+    } else if (kind == DT_UI_TOAST_ERROR) {
+        accent = DT_COLOR_ACCENT;
+
+        /* A failure is the one thing worth reading twice. */
+        linger_ms = 6000;
+    }
+
+    lv_obj_set_style_border_color(
+        s_ui.toast_panel,
+        color(accent),
+        0
+    );
+
+    lv_label_set_text(s_ui.toast_label, text);
+
+    lv_obj_remove_flag(
+        s_ui.toast_panel,
+        LV_OBJ_FLAG_HIDDEN
+    );
+
+    lv_obj_move_foreground(s_ui.toast_panel);
+
+    if (s_ui.toast_timer != NULL) {
+        lv_timer_set_period(s_ui.toast_timer, linger_ms);
+        lv_timer_reset(s_ui.toast_timer);
+        lv_timer_resume(s_ui.toast_timer);
+    }
+
+    return ESP_OK;
+}
+
+
+/* DT_PRINTER_LIST */
+esp_err_t dt_ui_update_printers(
+    const dt_ui_printer_model_t *model
+)
+{
+    if (!s_ui.ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (model == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_ui.printer_model = *model;
+
+    render_printer_model();
+
+    return ESP_OK;
+}
+
+
+esp_err_t dt_ui_set_printer_request_handler(
+    dt_ui_printer_request_handler_t handler,
+    void *ctx
+)
+{
+    s_printer_request_handler = handler;
+    s_printer_request_ctx = ctx;
+
+    return ESP_OK;
+}
+
+
+/* DT_MOVE_STEP */
+esp_err_t dt_ui_set_move_request_handler(
+    dt_ui_move_request_handler_t handler,
+    void *ctx
+)
+{
+    s_move_request_handler = handler;
+    s_move_request_ctx = ctx;
+
+    return ESP_OK;
+}
+
+
+/* DT_TEMP_ENTRY */
+esp_err_t dt_ui_set_temperature_request_handler(
+    dt_ui_temperature_request_handler_t handler,
+    void *ctx
+)
+{
+    s_temperature_request_handler = handler;
+    s_temperature_request_ctx = ctx;
 
     return ESP_OK;
 }

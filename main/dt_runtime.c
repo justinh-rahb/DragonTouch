@@ -1,4 +1,6 @@
 #include "dt_runtime.h"
+#include "dt_printers.h"
+#include "dt_printer_profile.h"
 #include "dt_portal.h"
 
 #include <math.h>
@@ -39,49 +41,6 @@ static const char *TAG = "dt_runtime";
 static esp_err_t run_gcode(const char *script);
 
 
-/*
- * RUNTIME_HEAP_DIAG
- * Temporary Stage 3 allocator diagnostics.
- */
-static void runtime_heap_diag(const char *where)
-{
-    const size_t free_internal =
-        heap_caps_get_free_size(
-            MALLOC_CAP_INTERNAL |
-            MALLOC_CAP_8BIT
-        );
-
-    const size_t largest_internal =
-        heap_caps_get_largest_free_block(
-            MALLOC_CAP_INTERNAL |
-            MALLOC_CAP_8BIT
-        );
-
-    const size_t free_dma =
-        heap_caps_get_free_size(
-            MALLOC_CAP_INTERNAL |
-            MALLOC_CAP_DMA
-        );
-
-    const size_t largest_dma =
-        heap_caps_get_largest_free_block(
-            MALLOC_CAP_INTERNAL |
-            MALLOC_CAP_DMA
-        );
-
-    ESP_LOGI(
-        TAG,
-        "RUNTIME_HEAP %s internal=%u largest=%u dma=%u dma_largest=%u psram=%u psram_largest=%u",
-        where,
-        (unsigned)free_internal,
-        (unsigned)largest_internal,
-        (unsigned)free_dma,
-        (unsigned)largest_dma,
-        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)
-    );
-}
-
 #define DT_STATUS_PERIOD_MS   1000
 #define DT_HTTP_TIMEOUT_MS    3500
 #define DT_HTTP_RESPONSE_MAX  12288
@@ -92,6 +51,8 @@ static void runtime_heap_diag(const char *where)
 #define DT_SYSTEM_PERIOD_MS 5000
 #define DT_AFC_STATUS_PERIOD_MS 2000
 #define DT_FILAMENT_QUEUE_LEN 4
+#define DT_TEMPERATURE_QUEUE_LEN 4 /* DT_TEMP_ENTRY */
+#define DT_MOVE_QUEUE_LEN 8 /* DT_MOVE_STEP */
 
 
 typedef struct {
@@ -106,10 +67,14 @@ typedef struct {
     char filename[192];
 
     dt_ui_connection_t connection;
+
+    /* DT_KLIPPER_ERROR */
+    char status_message[160];
     dt_ui_job_state_t job;
 
     uint8_t progress_percent;
     uint8_t fan_percent;
+    uint32_t aux_fan_revision;
 
     uint32_t elapsed_seconds;
     uint32_t remaining_seconds;
@@ -118,6 +83,9 @@ typedef struct {
     float nozzle_target_c;
     float bed_c;
     float bed_target_c;
+
+    /* DT_CHAMBER_TEMP: [temperature_sensor <profile>], no target */
+    float chamber_c;
 
     float x;
     float y;
@@ -143,14 +111,50 @@ typedef struct {
 } dt_runtime_filament_request_t;
 
 
+/* DT_TEMP_ENTRY */
+typedef struct {
+    dt_ui_heater_t heater;
+    int celsius;
+} dt_runtime_temperature_request_t;
+
+
+/* DT_MOVE_STEP */
+typedef struct {
+    dt_ui_move_axis_t axis;
+    int delta_mm;
+    int speed_mms;
+} dt_runtime_move_request_t;
+
+
+typedef struct {
+    char object_name[96];
+    char display_name[64];
+    dt_ui_fan_kind_t kind;
+    uint8_t percent;
+    bool speed_known;
+    bool controllable;
+} dt_runtime_aux_fan_t;
+
+
 static QueueHandle_t s_action_queue;
 static QueueHandle_t s_file_queue;
 static QueueHandle_t s_filament_queue;
+static QueueHandle_t s_temperature_queue;
+static QueueHandle_t s_move_queue;
 static char s_afc_lane_objects[DT_UI_AFC_MAX_LANES][64];
 static size_t s_afc_lane_object_count;
 static dt_ui_files_model_t *s_files_model;
 static dt_ui_filament_model_t *s_filament_model;
+
+/* DT_DYNAMIC_AUX_FANS */
+static dt_runtime_aux_fan_t *s_aux_fans;
+static size_t s_aux_fan_count;
+static uint32_t s_aux_fan_revision = 1;
+
 static char s_selected_file[DT_UI_FILE_PATH_MAX];
+
+/* DT_FILE_THUMBNAIL_PREVIEW */
+static uint8_t *s_file_thumbnail_data;
 
 static char s_moonraker_host[128];
 static char s_base_url[160];
@@ -158,6 +162,16 @@ static char s_api_key[160];
 
 static bool s_have_previous;
 static runtime_snapshot_t s_previous;
+
+/*
+ * DT_PRINTER_REBIND
+ *
+ * Set on the LVGL task when the user picks a different printer, consumed by
+ * the runtime task at the top of its loop. A plain bool is enough: one
+ * writer, one reader, and a missed edge would only defer the rebind by one
+ * iteration -- but volatile, since both tasks may sit on different cores.
+ */
+static volatile bool s_rebind_requested;
 
 
 static esp_err_t http_event(
@@ -253,17 +267,22 @@ static void load_moonraker_config(void)
 }
 
 
-static esp_err_t http_request_with_cap(
+static esp_err_t http_request_ex(
     esp_http_client_method_t method,
     const char *path,
     const char *json_body,
     char **response_out,
     int *http_status_out,
-    size_t response_cap
+    size_t response_cap,
+    size_t *response_len_out
 )
 {
     if (response_out != NULL) {
         *response_out = NULL;
+    }
+
+    if (response_len_out != NULL) {
+        *response_len_out = 0;
     }
 
     if (
@@ -394,6 +413,11 @@ static esp_err_t http_request_with_cap(
         return err;
     }
 
+    if (response_len_out != NULL) {
+        *response_len_out =
+            buffer.len;
+    }
+
     if (response_out != NULL) {
         *response_out =
             response;
@@ -402,6 +426,26 @@ static esp_err_t http_request_with_cap(
     }
 
     return ESP_OK;
+}
+
+static esp_err_t http_request_with_cap(
+    esp_http_client_method_t method,
+    const char *path,
+    const char *json_body,
+    char **response_out,
+    int *http_status_out,
+    size_t response_cap
+)
+{
+    return http_request_ex(
+        method,
+        path,
+        json_body,
+        response_out,
+        http_status_out,
+        response_cap,
+        NULL
+    );
 }
 
 static esp_err_t http_request(
@@ -582,6 +626,44 @@ static void push_files_ui(void)
             esp_err_to_name(err)
         );
     }
+}
+
+
+/*
+ * DT_UI_DETACH_BEFORE_FREE
+ *
+ * LVGL draws straight out of the runtime's thumbnail and snapshot buffers, so
+ * a buffer must be detached from the model AND that detach pushed to the UI
+ * before it is freed. push_files_ui() gives up after 200 ms, and a busy redraw
+ * -- a page switch, or the CONTAIN-scaled webcam pane -- routinely holds the
+ * lock for longer than that. A skipped push there is not a cosmetic miss: it
+ * leaves LVGL reading memory the next line frees.
+ *
+ * So this waits (0 means portMAX_DELAY). There is no deadlock risk: the LVGL
+ * task never blocks on the runtime task. Returns false only defensively; a
+ * caller that sees it must leak the buffer rather than free one still in use.
+ */
+static bool push_files_ui_blocking(void)
+{
+    if (s_files_model == NULL) {
+        return true;
+    }
+
+    if (!lvgl_port_lock(0)) {
+        ESP_LOGE(
+            TAG,
+            "LVGL lock unavailable; leaking a thumbnail rather than "
+            "freeing it while in use"
+        );
+
+        return false;
+    }
+
+    (void)dt_ui_update_files(s_files_model);
+
+    lvgl_port_unlock();
+
+    return true;
 }
 
 static void files_set_error(const char *message)
@@ -924,6 +1006,411 @@ static esp_err_t files_refresh_directory(void)
     return ESP_OK;
 }
 
+
+/*
+ * DT_FILE_THUMBNAIL_PREVIEW
+ *
+ * Moonraker metadata supplies PNG byte size, dimensions, and a path relative
+ * to the selected G-code. Only thumbnails fitting the existing ordinary HTTP
+ * response buffer are accepted, so the stable HTTP worker stays unchanged.
+ */
+static bool thumbnail_path_is_png(
+    const char *path
+)
+{
+    if (path == NULL) {
+        return false;
+    }
+
+    const size_t length = strlen(path);
+
+    return
+        length >= 4 &&
+        strcasecmp(path + length - 4, ".png") == 0;
+}
+
+
+static bool thumbnail_url_encode_path(
+    const char *input,
+    char *output,
+    size_t output_size
+)
+{
+    static const char hex[] =
+        "0123456789ABCDEF";
+
+    if (
+        input == NULL ||
+        output == NULL ||
+        output_size == 0
+    ) {
+        return false;
+    }
+
+    size_t used = 0;
+
+    for (
+        const unsigned char *p =
+            (const unsigned char *)input;
+        *p != '\0';
+        ++p
+    ) {
+        const bool alpha =
+            (*p >= 'a' && *p <= 'z') ||
+            (*p >= 'A' && *p <= 'Z');
+
+        const bool digit =
+            *p >= '0' && *p <= '9';
+
+        const bool passthrough =
+            alpha ||
+            digit ||
+            *p == '-' ||
+            *p == '_' ||
+            *p == '.' ||
+            *p == '~' ||
+            *p == '/';
+
+        const size_t needed =
+            passthrough ? 1U : 3U;
+
+        if (
+            used + needed + 1U >
+            output_size
+        ) {
+            return false;
+        }
+
+        if (passthrough) {
+            output[used++] = (char)*p;
+        } else {
+            output[used++] = '%';
+            output[used++] =
+                hex[(*p >> 4) & 0x0f];
+            output[used++] =
+                hex[*p & 0x0f];
+        }
+    }
+
+    output[used] = '\0';
+    return true;
+}
+
+
+/* DT_FILE_THUMBNAIL_NOINLINE_FIX */
+static __attribute__((noinline)) esp_err_t files_load_thumbnail(
+    cJSON *metadata,
+    const char *relative_gcode
+)
+{
+    if (
+        s_files_model == NULL ||
+        metadata == NULL ||
+        relative_gcode == NULL
+    ) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    cJSON *thumbnails =
+        cJSON_GetObjectItemCaseSensitive(
+            metadata,
+            "thumbnails"
+        );
+
+    if (!cJSON_IsArray(thumbnails)) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    const char *best_relative = NULL;
+    uint32_t best_size = 0;
+    uint16_t best_width = 0;
+    uint16_t best_height = 0;
+    unsigned best_score = UINT_MAX;
+
+    cJSON *item = NULL;
+
+    cJSON_ArrayForEach(item, thumbnails) {
+        cJSON *relative_path =
+            cJSON_GetObjectItemCaseSensitive(
+                item,
+                "relative_path"
+            );
+
+        cJSON *size =
+            cJSON_GetObjectItemCaseSensitive(
+                item,
+                "size"
+            );
+
+        cJSON *width =
+            cJSON_GetObjectItemCaseSensitive(
+                item,
+                "width"
+            );
+
+        cJSON *height =
+            cJSON_GetObjectItemCaseSensitive(
+                item,
+                "height"
+            );
+
+        if (
+            !cJSON_IsString(relative_path) ||
+            relative_path->valuestring == NULL ||
+            !thumbnail_path_is_png(
+                relative_path->valuestring
+            ) ||
+            !cJSON_IsNumber(size) ||
+            !cJSON_IsNumber(width) ||
+            !cJSON_IsNumber(height)
+        ) {
+            continue;
+        }
+
+        const uint32_t candidate_size =
+            size->valuedouble > 0
+                ? (uint32_t)size->valuedouble
+                : 0U;
+
+        const uint32_t candidate_width =
+            width->valuedouble > 0
+                ? (uint32_t)width->valuedouble
+                : 0U;
+
+        const uint32_t candidate_height =
+            height->valuedouble > 0
+                ? (uint32_t)height->valuedouble
+                : 0U;
+
+        /*
+         * http_event reserves one trailing NUL byte. Embedded NULs inside PNG
+         * payloads are fine because decoding uses metadata's declared size.
+         */
+        if (
+            candidate_size < 24U ||
+            candidate_size >= DT_HTTP_RESPONSE_MAX ||
+            candidate_width == 0U ||
+            candidate_height == 0U ||
+            candidate_width > UINT16_MAX ||
+            candidate_height > UINT16_MAX
+        ) {
+            continue;
+        }
+
+        const uint32_t max_dimension =
+            candidate_width > candidate_height
+                ? candidate_width
+                : candidate_height;
+
+        /*
+         * DT_FILE_THUMBNAIL_150_PREVIEW
+         *
+         * Select the embedded PNG whose largest dimension is closest to 150.
+         * This prefers Orca's existing 48x48 thumbnail over its 300x300
+         * thumbnail, keeping PNG decode memory small.
+         */
+        const unsigned score =
+            max_dimension > 150U
+                ? (unsigned)(max_dimension - 150U)
+                : (unsigned)(150U - max_dimension);
+
+        if (
+            best_relative == NULL ||
+            score < best_score ||
+            (
+                score == best_score &&
+                candidate_size > best_size
+            )
+        ) {
+            best_relative =
+                relative_path->valuestring;
+            best_size = candidate_size;
+            best_width =
+                (uint16_t)candidate_width;
+            best_height =
+                (uint16_t)candidate_height;
+            best_score = score;
+        }
+    }
+
+    if (best_relative == NULL) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    char thumbnail_path[512] = {0};
+    const char *slash =
+        strrchr(relative_gcode, '/');
+
+    if (slash != NULL) {
+        const size_t parent_length =
+            (size_t)(slash - relative_gcode);
+
+        if (
+            parent_length +
+            1U +
+            strlen(best_relative) +
+            1U >
+            sizeof(thumbnail_path)
+        ) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+
+        snprintf(
+            thumbnail_path,
+            sizeof(thumbnail_path),
+            "%.*s/%s",
+            (int)parent_length,
+            relative_gcode,
+            best_relative
+        );
+    } else {
+        if (
+            strlen(best_relative) + 1U >
+            sizeof(thumbnail_path)
+        ) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+
+        snprintf(
+            thumbnail_path,
+            sizeof(thumbnail_path),
+            "%s",
+            best_relative
+        );
+    }
+
+    char encoded_path[640] = {0};
+
+    if (
+        !thumbnail_url_encode_path(
+            thumbnail_path,
+            encoded_path,
+            sizeof(encoded_path)
+        )
+    ) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    char request_path[768] = {0};
+
+    int written =
+        snprintf(
+            request_path,
+            sizeof(request_path),
+            "/server/files/gcodes/%s",
+            encoded_path
+        );
+
+    if (
+        written < 0 ||
+        (size_t)written >=
+            sizeof(request_path)
+    ) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    char *response = NULL;
+    size_t response_len = 0;
+
+    /*
+     * DT_FILE_THUMBNAIL_ACTUAL_LEN
+     *
+     * Use http_request_ex() (not http_request()) so we learn the ACTUAL
+     * number of bytes received for the PNG, rather than trusting Moonraker
+     * metadata's declared "size". The two can disagree (stale metadata,
+     * a server-side re-slice, etc.), and LVGL's LodePNG decoder needs the
+     * real byte count in data_size to decode correctly -- feeding it a
+     * wrong length is a likely cause of thumbnails silently failing to
+     * decode/display.
+     */
+    esp_err_t err =
+        http_request_ex(
+            HTTP_METHOD_GET,
+            request_path,
+            NULL,
+            &response,
+            NULL,
+            DT_HTTP_RESPONSE_MAX,
+            &response_len
+        );
+
+    if (err != ESP_OK) {
+        free(response);
+        return err;
+    }
+
+    static const uint8_t png_magic[] = {
+        0x89, 0x50, 0x4e, 0x47,
+        0x0d, 0x0a, 0x1a, 0x0a,
+    };
+
+    if (
+        response == NULL ||
+        memcmp(
+            response,
+            png_magic,
+            sizeof(png_magic)
+        ) != 0
+    ) {
+        free(response);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    /*
+     * http_request allocates response data in PSRAM. Retain that allocation
+     * directly as the LVGL variable-source PNG.
+     */
+    if (response_len < 24U) {
+        ESP_LOGW(
+            TAG,
+            "thumbnail response too small: actual=%u metadata=%u path=%s",
+            (unsigned)response_len,
+            (unsigned)best_size,
+            thumbnail_path
+        );
+
+        free(response);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    if (response_len != (size_t)best_size) {
+        ESP_LOGW(
+            TAG,
+            "thumbnail size mismatch: metadata=%u actual=%u path=%s (using actual)",
+            (unsigned)best_size,
+            (unsigned)response_len,
+            thumbnail_path
+        );
+    }
+
+    s_file_thumbnail_data =
+        (uint8_t *)response;
+
+    s_files_model->thumbnail_data =
+        s_file_thumbnail_data;
+
+    s_files_model->thumbnail_size =
+        (uint32_t)response_len;
+
+    s_files_model->thumbnail_width =
+        best_width;
+
+    s_files_model->thumbnail_height =
+        best_height;
+
+    ESP_LOGD(
+        TAG,
+        "thumbnail loaded %ux%u bytes=%u path=%s",
+        (unsigned)best_width,
+        (unsigned)best_height,
+        (unsigned)best_size,
+        thumbnail_path
+    );
+
+    return ESP_OK;
+}
+
+
 static esp_err_t files_select(const char *full_path)
 {
     if (
@@ -979,6 +1466,19 @@ static esp_err_t files_select(const char *full_path)
     s_files_model->filament_weight_g = 0.0f;
     s_files_model->filament_length_mm = 0.0f;
     s_files_model->layer_height_mm = 0.0f;
+
+    /*
+     * DT_FILE_THUMBNAIL_PREVIEW
+     * Detach the old LVGL source before freeing its runtime-owned bytes.
+     */
+    uint8_t *old_thumbnail =
+        s_file_thumbnail_data;
+
+    s_file_thumbnail_data = NULL;
+    s_files_model->thumbnail_data = NULL;
+    s_files_model->thumbnail_size = 0;
+    s_files_model->thumbnail_width = 0;
+    s_files_model->thumbnail_height = 0;
     s_files_model->slicer[0] = '\0';
     s_files_model->filament_type[0] = '\0';
 
@@ -1001,7 +1501,10 @@ static esp_err_t files_select(const char *full_path)
         "Loading metadata..."
     );
 
-    push_files_ui();
+    /* DT_UI_DETACH_BEFORE_FREE: the detach must land before the free. */
+    if (push_files_ui_blocking()) {
+        free(old_thumbnail);
+    }
 
     char encoded[640] = {0};
 
@@ -1143,6 +1646,26 @@ static esp_err_t files_select(const char *full_path)
             sizeof(s_files_model->filament_type),
             "%s",
             filament_type->valuestring
+        );
+    }
+
+    /*
+     * Missing or oversized thumbnails are non-fatal; metadata still renders.
+     */
+    esp_err_t thumbnail_err =
+        files_load_thumbnail(
+            payload,
+            relative
+        );
+
+    if (
+        thumbnail_err != ESP_OK &&
+        thumbnail_err != ESP_ERR_NOT_FOUND
+    ) {
+        ESP_LOGW(
+            TAG,
+            "thumbnail unavailable: %s",
+            esp_err_to_name(thumbnail_err)
         );
     }
 
@@ -1413,10 +1936,625 @@ static esp_err_t discover_afc_registered_commands(void)
             "AFC_LANE_RESET"
         );
 
+    /*
+     * DT_AFC_UNLOAD_LOADED_LANE
+     * TOOL_UNLOAD is a natively-registered AFC command (like the two
+     * above), not a user-defined [gcode_macro] -- it only shows up in
+     * /printer/gcode/help, never in the "gcode_macro <name>" config
+     * object scan that BT_CHANGE_TOOL/BT_LANE_EJECT/BT_RESUME come from.
+     */
+    s_filament_model->has_afc_tool_unload =
+        json_raw_has_object_key(
+            response,
+            "TOOL_UNLOAD"
+        );
+
     free(response);
 
     return ESP_OK;
 }
+
+
+
+static esp_err_t run_gcode(const char *script);
+
+/*
+ * DT_DYNAMIC_AUX_FANS
+ *
+ * Discover fan_generic objects as manually controllable. Automatic Klipper fan
+ * classes are status-only: DragonTouch must not override their policy.
+ */
+static bool aux_fan_command_name_safe(
+    const char *name
+)
+{
+    if (name == NULL || name[0] == '\0') {
+        return false;
+    }
+
+    for (const unsigned char *p =
+             (const unsigned char *)name;
+         *p != '\0';
+         ++p) {
+        const bool alpha =
+            (*p >= 'a' && *p <= 'z') ||
+            (*p >= 'A' && *p <= 'Z');
+
+        const bool digit =
+            *p >= '0' && *p <= '9';
+
+        if (
+            !alpha &&
+            !digit &&
+            *p != '_' &&
+            *p != '-'
+        ) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+static bool aux_fan_url_encode(
+    const char *input,
+    char *output,
+    size_t output_size
+)
+{
+    static const char hex[] =
+        "0123456789ABCDEF";
+
+    if (
+        input == NULL ||
+        output == NULL ||
+        output_size == 0
+    ) {
+        return false;
+    }
+
+    size_t used = 0;
+
+    for (
+        const unsigned char *p =
+            (const unsigned char *)input;
+        *p != '\0';
+        ++p
+    ) {
+        const bool alpha =
+            (*p >= 'a' && *p <= 'z') ||
+            (*p >= 'A' && *p <= 'Z');
+
+        const bool digit =
+            *p >= '0' && *p <= '9';
+
+        const bool unreserved =
+            alpha ||
+            digit ||
+            *p == '-' ||
+            *p == '_' ||
+            *p == '.' ||
+            *p == '~';
+
+        const size_t needed =
+            unreserved ? 1u : 3u;
+
+        if (
+            used + needed + 1 >
+            output_size
+        ) {
+            return false;
+        }
+
+        if (unreserved) {
+            output[used++] =
+                (char)*p;
+        } else {
+            output[used++] = '%';
+            output[used++] =
+                hex[(*p >> 4) & 0x0f];
+            output[used++] =
+                hex[*p & 0x0f];
+        }
+    }
+
+    output[used] = '\0';
+    return true;
+}
+
+
+static void aux_fans_mark_offline(void)
+{
+    bool changed = false;
+
+    for (size_t i = 0; i < s_aux_fan_count; ++i) {
+        if (s_aux_fans[i].speed_known) {
+            s_aux_fans[i].speed_known = false;
+            s_aux_fans[i].percent = 255;
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        ++s_aux_fan_revision;
+    }
+}
+
+
+static esp_err_t discover_aux_fans(void)
+{
+    if (s_aux_fans == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char *response = NULL;
+
+    esp_err_t err =
+        http_request(
+            HTTP_METHOD_GET,
+            "/printer/objects/list",
+            NULL,
+            &response,
+            NULL
+        );
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    cJSON *root = cJSON_Parse(response);
+    free(response);
+
+    if (root == NULL) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    cJSON *payload = moonraker_payload(root);
+    cJSON *objects =
+        cJSON_GetObjectItemCaseSensitive(
+            payload,
+            "objects"
+        );
+
+    if (!cJSON_IsArray(objects)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    dt_runtime_aux_fan_t
+        discovered[DT_UI_AUX_FAN_MAX];
+
+    memset(
+        discovered,
+        0,
+        sizeof(discovered)
+    );
+
+    size_t count = 0;
+
+    /*
+     * Pass 0: manually controllable fan_generic entries.
+     * Pass 1: automatic/status-only fan classes.
+     */
+    for (int pass = 0; pass < 2; ++pass) {
+        cJSON *item = NULL;
+
+        cJSON_ArrayForEach(item, objects) {
+            if (
+                count >= DT_UI_AUX_FAN_MAX ||
+                !cJSON_IsString(item) ||
+                item->valuestring == NULL
+            ) {
+                continue;
+            }
+
+            const char *object = item->valuestring;
+            const char *display = NULL;
+            dt_ui_fan_kind_t kind;
+            bool controllable = false;
+            bool matched = false;
+
+            if (
+                strncmp(
+                    object,
+                    "fan_generic ",
+                    12
+                ) == 0
+            ) {
+                if (pass != 0) {
+                    continue;
+                }
+
+                display = object + 12;
+                kind = DT_UI_FAN_KIND_GENERIC;
+                controllable =
+                    aux_fan_command_name_safe(
+                        display
+                    );
+                matched = true;
+            } else if (pass == 1) {
+                if (
+                    strncmp(
+                        object,
+                        "controller_fan ",
+                        15
+                    ) == 0
+                ) {
+                    display = object + 15;
+                    kind =
+                        DT_UI_FAN_KIND_CONTROLLER;
+                    matched = true;
+                } else if (
+                    strncmp(
+                        object,
+                        "heater_fan ",
+                        11
+                    ) == 0
+                ) {
+                    display = object + 11;
+                    kind =
+                        DT_UI_FAN_KIND_HEATER;
+                    matched = true;
+                } else if (
+                    strncmp(
+                        object,
+                        "temperature_fan ",
+                        16
+                    ) == 0
+                ) {
+                    display = object + 16;
+                    kind =
+                        DT_UI_FAN_KIND_TEMPERATURE;
+                    matched = true;
+                }
+            }
+
+            if (!matched || display == NULL) {
+                continue;
+            }
+
+            dt_runtime_aux_fan_t *fan =
+                &discovered[count];
+
+            snprintf(
+                fan->object_name,
+                sizeof(fan->object_name),
+                "%s",
+                object
+            );
+
+            snprintf(
+                fan->display_name,
+                sizeof(fan->display_name),
+                "%s",
+                display
+            );
+
+            fan->kind = kind;
+            fan->controllable = controllable;
+            fan->percent = 255;
+            fan->speed_known = false;
+
+            for (
+                size_t old = 0;
+                old < s_aux_fan_count;
+                ++old
+            ) {
+                if (
+                    strcmp(
+                        s_aux_fans[old].object_name,
+                        fan->object_name
+                    ) == 0
+                ) {
+                    fan->percent =
+                        s_aux_fans[old].percent;
+                    fan->speed_known =
+                        s_aux_fans[old].speed_known;
+                    break;
+                }
+            }
+
+            ++count;
+        }
+    }
+
+    bool changed =
+        count != s_aux_fan_count;
+
+    if (!changed) {
+        for (size_t i = 0; i < count; ++i) {
+            if (
+                strcmp(
+                    discovered[i].object_name,
+                    s_aux_fans[i].object_name
+                ) != 0 ||
+                discovered[i].kind !=
+                    s_aux_fans[i].kind ||
+                discovered[i].controllable !=
+                    s_aux_fans[i].controllable
+            ) {
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    memset(
+        s_aux_fans,
+        0,
+        sizeof(*s_aux_fans) *
+            DT_UI_AUX_FAN_MAX
+    );
+
+    memcpy(
+        s_aux_fans,
+        discovered,
+        sizeof(discovered)
+    );
+
+    s_aux_fan_count = count;
+
+    if (changed) {
+        ++s_aux_fan_revision;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "fan capabilities auxiliary=%u",
+        (unsigned)s_aux_fan_count
+    );
+
+    for (size_t i = 0; i < s_aux_fan_count; ++i) {
+        ESP_LOGD(
+            TAG,
+            "fan[%u] object='%s' control=%d",
+            (unsigned)i,
+            s_aux_fans[i].object_name,
+            s_aux_fans[i].controllable
+                ? 1
+                : 0
+        );
+    }
+
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+
+static esp_err_t query_aux_fan_status(void)
+{
+    if (
+        s_aux_fans == NULL ||
+        s_aux_fan_count == 0
+    ) {
+        return ESP_OK;
+    }
+
+    const size_t endpoint_cap = 2048;
+
+    char *endpoint =
+        heap_caps_calloc(
+            1,
+            endpoint_cap,
+            MALLOC_CAP_SPIRAM |
+                MALLOC_CAP_8BIT
+        );
+
+    if (endpoint == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t used =
+        (size_t)snprintf(
+            endpoint,
+            endpoint_cap,
+            "/printer/objects/query?"
+        );
+
+    for (size_t i = 0; i < s_aux_fan_count; ++i) {
+        char encoded[256] = {0};
+
+        if (
+            !aux_fan_url_encode(
+                s_aux_fans[i].object_name,
+                encoded,
+                sizeof(encoded)
+            )
+        ) {
+            free(endpoint);
+            return ESP_ERR_INVALID_SIZE;
+        }
+
+        int written =
+            snprintf(
+                endpoint + used,
+                endpoint_cap - used,
+                "%s%s",
+                i == 0 ? "" : "&",
+                encoded
+            );
+
+        if (
+            written < 0 ||
+            (size_t)written >=
+                endpoint_cap - used
+        ) {
+            free(endpoint);
+            return ESP_ERR_INVALID_SIZE;
+        }
+
+        used += (size_t)written;
+    }
+
+    char *response = NULL;
+
+    esp_err_t err =
+        http_request(
+            HTTP_METHOD_GET,
+            endpoint,
+            NULL,
+            &response,
+            NULL
+        );
+
+    free(endpoint);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    cJSON *root = cJSON_Parse(response);
+    free(response);
+
+    if (root == NULL) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    cJSON *payload = moonraker_payload(root);
+    cJSON *status =
+        cJSON_GetObjectItemCaseSensitive(
+            payload,
+            "status"
+        );
+
+    if (!cJSON_IsObject(status)) {
+        status = payload;
+    }
+
+    bool changed = false;
+
+    for (size_t i = 0; i < s_aux_fan_count; ++i) {
+        cJSON *fan =
+            cJSON_GetObjectItemCaseSensitive(
+                status,
+                s_aux_fans[i].object_name
+            );
+
+        float speed = NAN;
+        bool known =
+            json_number(
+                fan,
+                "speed",
+                &speed
+            ) &&
+            isfinite(speed);
+
+        uint8_t percent = 255;
+
+        if (known) {
+            if (speed < 0.0f) {
+                speed = 0.0f;
+            }
+
+            if (speed > 1.0f) {
+                speed = 1.0f;
+            }
+
+            percent =
+                (uint8_t)(
+                    speed * 100.0f +
+                    0.5f
+                );
+        }
+
+        if (
+            s_aux_fans[i].speed_known !=
+                known ||
+            s_aux_fans[i].percent !=
+                percent
+        ) {
+            s_aux_fans[i].speed_known =
+                known;
+            s_aux_fans[i].percent =
+                percent;
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        ++s_aux_fan_revision;
+    }
+
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+
+static esp_err_t execute_aux_fan_action(
+    dt_ui_action_t action
+)
+{
+    /*
+     * DT_DYNAMIC_AUX_FAN_SLIDERS
+     *
+     * Each discovered fan slot owns 101 contiguous action values, one for
+     * every integer percentage from 0 through 100.
+     */
+    if (
+        action < DT_UI_ACTION_AUX_FAN_BASE ||
+        action > DT_UI_ACTION_AUX_FAN_LAST
+    ) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const unsigned offset =
+        (unsigned)(
+            action -
+            DT_UI_ACTION_AUX_FAN_BASE
+        );
+
+    const size_t slot =
+        offset /
+        DT_UI_AUX_FAN_LEVEL_COUNT;
+
+    const unsigned percent =
+        offset %
+        DT_UI_AUX_FAN_LEVEL_COUNT;
+
+    if (
+        s_aux_fans == NULL ||
+        slot >= s_aux_fan_count ||
+        percent > 100 ||
+        !s_aux_fans[slot].controllable
+    ) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char speed[8] = {0};
+
+    if (percent >= 100) {
+        snprintf(speed, sizeof(speed), "1.00");
+    } else {
+        snprintf(
+            speed,
+            sizeof(speed),
+            "0.%02u",
+            percent
+        );
+    }
+
+    char command[192] = {0};
+
+    int written =
+        snprintf(
+            command,
+            sizeof(command),
+            "SET_FAN_SPEED FAN=%s SPEED=%s",
+            s_aux_fans[slot].display_name,
+            speed
+        );
+
+    if (
+        written < 0 ||
+        (size_t)written >= sizeof(command)
+    ) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    return run_gcode(command);
+}
+
 
 
 static esp_err_t discover_filament_capabilities(void)
@@ -1474,6 +2612,7 @@ static esp_err_t discover_filament_capabilities(void)
     s_filament_model->has_bt_change_tool = false;
     s_filament_model->has_bt_lane_eject = false;
     s_filament_model->has_bt_resume = false;
+    s_filament_model->has_afc_tool_unload = false;
     s_filament_model->has_afc_clear_message = false;
     s_filament_model->has_afc_lane_reset = false;
     s_filament_model->load_macro[0] = '\0';
@@ -1674,7 +2813,7 @@ static esp_err_t discover_filament_capabilities(void)
 
     ESP_LOGI(
         TAG,
-        "filament capabilities load=%d unload=%d m600=%d afc=%d mmu=%d toolchanger=%d bt_change=%d bt_eject=%d bt_resume=%d clear=%d lane_reset=%d lanes=%u",
+        "filament capabilities load=%d unload=%d m600=%d afc=%d mmu=%d toolchanger=%d bt_change=%d bt_eject=%d bt_resume=%d clear=%d lane_reset=%d tool_unload=%d lanes=%u",
         s_filament_model->has_load_macro,
         s_filament_model->has_unload_macro,
         s_filament_model->has_m600,
@@ -1686,6 +2825,7 @@ static esp_err_t discover_filament_capabilities(void)
         s_filament_model->has_bt_resume,
         s_filament_model->has_afc_clear_message,
         s_filament_model->has_afc_lane_reset,
+        s_filament_model->has_afc_tool_unload,
         (unsigned)s_afc_lane_object_count
     );
 
@@ -1745,6 +2885,524 @@ static bool json_bool_value(
         );
 
     return cJSON_IsTrue(item);
+}
+
+
+/* ---------------------------------------------------------------------- */
+/* DT_WEBCAM_SNAPSHOT                                                      */
+/*                                                                          */
+/* On-demand JPEG snapshot, not a live stream -- the ESP32-S3 has no       */
+/* hardware video/JPEG codec, so a continuous decode loop isn't a good     */
+/* fit. Discovers the configured webcam via Moonraker's own webcam         */
+/* management API (/server/webcams/list) rather than assuming a port/path */
+/* -- same "ask the printer, don't guess" approach AFC capabilities use.   */
+/* ---------------------------------------------------------------------- */
+
+#define DT_WEBCAM_HTTP_TIMEOUT_MS    8000
+#define DT_WEBCAM_SNAPSHOT_MAX_BYTES (400 * 1024)
+
+static dt_ui_webcam_model_t s_webcam_model;
+static uint8_t *s_webcam_jpeg_data;
+static char s_webcam_snapshot_url[256];
+
+
+static void push_webcam_ui(void)
+{
+    if (!lvgl_port_lock(200)) {
+        ESP_LOGW(
+            TAG,
+            "LVGL lock timeout; skipping webcam UI update"
+        );
+        return;
+    }
+
+    esp_err_t err =
+        dt_ui_update_webcam(&s_webcam_model);
+
+    lvgl_port_unlock();
+
+    if (err != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "dt_ui_update_webcam failed: %s",
+            esp_err_to_name(err)
+        );
+    }
+}
+
+
+/* DT_UI_DETACH_BEFORE_FREE -- see push_files_ui_blocking(). */
+static bool push_webcam_ui_blocking(void)
+{
+    if (!lvgl_port_lock(0)) {
+        ESP_LOGE(
+            TAG,
+            "LVGL lock unavailable; leaking a snapshot rather than "
+            "freeing it while in use"
+        );
+
+        return false;
+    }
+
+    (void)dt_ui_update_webcam(&s_webcam_model);
+
+    lvgl_port_unlock();
+
+    return true;
+}
+
+
+/*
+ * Like http_request_ex(), but against an arbitrary absolute URL instead of
+ * s_base_url + path -- the webcam server is very often a different host
+ * and/or port than Moonraker's own API. No X-Api-Key header is sent here
+ * deliberately: that key belongs to Moonraker, not whatever server the
+ * discovered snapshot URL happens to point at.
+ */
+static esp_err_t http_fetch_url_raw(
+    const char *url,
+    uint8_t **response_out,
+    size_t *response_len_out,
+    size_t response_cap,
+    uint32_t timeout_ms
+)
+{
+    if (response_out != NULL) {
+        *response_out = NULL;
+    }
+
+    if (response_len_out != NULL) {
+        *response_len_out = 0;
+    }
+
+    if (url == NULL || url[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t *response =
+        heap_caps_malloc(
+            response_cap,
+            MALLOC_CAP_SPIRAM |
+            MALLOC_CAP_8BIT
+        );
+
+    if (response == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    http_buffer_t buffer = {
+        .data = (char *)response,
+        .len = 0,
+        .cap = response_cap,
+    };
+
+    response[0] = '\0';
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .event_handler = http_event,
+        .user_data = &buffer,
+        .timeout_ms = timeout_ms,
+        .buffer_size = 2048,
+        .buffer_size_tx = 1024,
+    };
+
+    esp_http_client_handle_t client =
+        esp_http_client_init(&config);
+
+    if (client == NULL) {
+        free(response);
+        return ESP_FAIL;
+    }
+
+    esp_http_client_set_method(
+        client,
+        HTTP_METHOD_GET
+    );
+
+    esp_err_t err =
+        esp_http_client_perform(
+            client
+        );
+
+    int status = -1;
+
+    if (err == ESP_OK) {
+        status =
+            esp_http_client_get_status_code(
+                client
+            );
+
+        if (
+            status < 200 ||
+            status >= 300
+        ) {
+            err = ESP_FAIL;
+        }
+    }
+
+    esp_http_client_cleanup(
+        client
+    );
+
+    if (err != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "webcam snapshot fetch failed url=%s status=%d err=%s",
+            url,
+            status,
+            esp_err_to_name(err)
+        );
+
+        free(response);
+        return err;
+    }
+
+    if (response_len_out != NULL) {
+        *response_len_out = buffer.len;
+    }
+
+    if (response_out != NULL) {
+        *response_out = response;
+    } else {
+        free(response);
+    }
+
+    return ESP_OK;
+}
+
+
+static esp_err_t discover_webcam(void)
+{
+    if (s_base_url[0] == '\0') {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char *response = NULL;
+
+    esp_err_t err =
+        http_request(
+            HTTP_METHOD_GET,
+            "/server/webcams/list",
+            NULL,
+            &response,
+            NULL
+        );
+
+    if (err != ESP_OK) {
+        free(response);
+        return err;
+    }
+
+    cJSON *root =
+        cJSON_Parse(response);
+
+    free(response);
+
+    if (root == NULL) {
+        return ESP_FAIL;
+    }
+
+    cJSON *payload =
+        moonraker_payload(root);
+
+    cJSON *webcams =
+        cJSON_GetObjectItemCaseSensitive(
+            payload,
+            "webcams"
+        );
+
+    s_webcam_model.configured = false;
+    s_webcam_model.name[0] = '\0';
+    s_webcam_snapshot_url[0] = '\0';
+
+    if (cJSON_IsArray(webcams)) {
+        cJSON *first =
+            cJSON_GetArrayItem(
+                webcams,
+                0
+            );
+
+        if (cJSON_IsObject(first)) {
+            json_copy_string(
+                first,
+                "name",
+                s_webcam_model.name,
+                sizeof(s_webcam_model.name)
+            );
+
+            cJSON *snapshot_url =
+                cJSON_GetObjectItemCaseSensitive(
+                    first,
+                    "snapshot_url"
+                );
+
+            if (
+                cJSON_IsString(snapshot_url) &&
+                snapshot_url->valuestring != NULL &&
+                snapshot_url->valuestring[0] != '\0'
+            ) {
+                const char *raw =
+                    snapshot_url->valuestring;
+
+                if (
+                    strncasecmp(raw, "http://", 7) == 0 ||
+                    strncasecmp(raw, "https://", 8) == 0
+                ) {
+                    snprintf(
+                        s_webcam_snapshot_url,
+                        sizeof(s_webcam_snapshot_url),
+                        "%s",
+                        raw
+                    );
+                } else {
+                    /*
+                     * A relative snapshot_url is meant to be resolved
+                     * against wherever the web UI (Mainsail/Fluidd) is
+                     * served from -- normally the standard nginx
+                     * front-end on port 80 -- not Moonraker's own API
+                     * port. s_base_url targets the API port directly,
+                     * so this is built separately rather than reused.
+                     */
+                    snprintf(
+                        s_webcam_snapshot_url,
+                        sizeof(s_webcam_snapshot_url),
+                        "http://%s%s%s",
+                        s_moonraker_host,
+                        raw[0] == '/' ? "" : "/",
+                        raw
+                    );
+                }
+
+                s_webcam_model.configured = true;
+            }
+        }
+    }
+
+    cJSON_Delete(root);
+
+    return ESP_OK;
+}
+
+
+/*
+ * DT_WEBCAM_JFIF_SHIM
+ *
+ * LVGL's TJpgDec binding decides whether a buffer is a JPEG with a strict
+ * 10-byte signature test: FF D8 FF E0 00 10 "JFIF". mjpg-streamer -- what
+ * crowsnest serves for the "mjpegstreamer-adaptive" service -- emits a bare
+ * baseline JPEG that goes straight from SOI to SOF0 (FF D8 FF C0 ...) with no
+ * APP0 segment at all. That fails the signature test, so TJpgDec declines the
+ * image entirely, and LVGL's built-in bin_decoder claims it instead (it accepts
+ * any source whose color format isn't UNKNOWN, and LV_COLOR_FORMAT_RAW isn't).
+ * bin_decoder then "succeeds" by echoing back our own zeroed header, which is
+ * why the decode reported OK at 0x0 and nothing ever drew.
+ *
+ * Splice a standard JFIF APP0 segment in right after SOI. APP0 is metadata --
+ * TJpgDec skips it as an unknown segment -- and the result is a structurally
+ * valid JFIF file that passes the signature test.
+ */
+static esp_err_t webcam_ensure_jfif(
+    uint8_t **data,
+    size_t *size
+)
+{
+    static const uint8_t jfif_signature[10] = {
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46
+    };
+
+    static const uint8_t jfif_app0[18] = {
+        0xFF, 0xE0,             /* APP0 marker */
+        0x00, 0x10,             /* segment length (16, covers itself) */
+        0x4A, 0x46, 0x49, 0x46, /* "JFIF" */
+        0x00,                   /* NUL terminator */
+        0x01, 0x01,             /* version 1.01 */
+        0x00,                   /* density units: none */
+        0x00, 0x01,             /* X density */
+        0x00, 0x01,             /* Y density */
+        0x00,                   /* thumbnail width */
+        0x00                    /* thumbnail height */
+    };
+
+    uint8_t *src = *data;
+    size_t src_size = *size;
+
+    if (src == NULL || src_size < 4) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    if (src[0] != 0xFF || src[1] != 0xD8) {
+        ESP_LOGW(
+            TAG,
+            "webcam snapshot is not a JPEG (starts %02X %02X)",
+            (unsigned)src[0],
+            (unsigned)src[1]
+        );
+
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    if (
+        src_size >= sizeof(jfif_signature) &&
+        memcmp(src, jfif_signature, sizeof(jfif_signature)) == 0
+    ) {
+        /* Already carries the APP0 segment LVGL insists on. */
+        return ESP_OK;
+    }
+
+    size_t padded_size = src_size + sizeof(jfif_app0);
+
+    uint8_t *padded =
+        heap_caps_malloc(
+            padded_size,
+            MALLOC_CAP_SPIRAM |
+            MALLOC_CAP_8BIT
+        );
+
+    if (padded == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    padded[0] = 0xFF; /* SOI */
+    padded[1] = 0xD8;
+
+    memcpy(
+        padded + 2,
+        jfif_app0,
+        sizeof(jfif_app0)
+    );
+
+    memcpy(
+        padded + 2 + sizeof(jfif_app0),
+        src + 2,
+        src_size - 2
+    );
+
+    free(src);
+
+    *data = padded;
+    *size = padded_size;
+
+    return ESP_OK;
+}
+
+
+static esp_err_t webcam_refresh(void)
+{
+    if (s_base_url[0] == '\0') {
+        snprintf(
+            s_webcam_model.status_text,
+            sizeof(s_webcam_model.status_text),
+            "Printer offline."
+        );
+
+        push_webcam_ui();
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_webcam_model.loading = true;
+    s_webcam_model.error = false;
+    s_webcam_model.status_text[0] = '\0';
+
+    push_webcam_ui();
+
+    esp_err_t err = discover_webcam();
+
+    if (
+        err != ESP_OK ||
+        !s_webcam_model.configured
+    ) {
+        s_webcam_model.loading = false;
+        s_webcam_model.has_image = false;
+        s_webcam_model.error = true;
+
+        snprintf(
+            s_webcam_model.status_text,
+            sizeof(s_webcam_model.status_text),
+            err != ESP_OK
+                ? "Could not reach Moonraker's webcam list."
+                : "Moonraker reports no webcam configured."
+        );
+
+        push_webcam_ui();
+
+        return err != ESP_OK ? err : ESP_ERR_NOT_FOUND;
+    }
+
+    uint8_t *jpeg_data = NULL;
+    size_t jpeg_size = 0;
+
+    err =
+        http_fetch_url_raw(
+            s_webcam_snapshot_url,
+            &jpeg_data,
+            &jpeg_size,
+            DT_WEBCAM_SNAPSHOT_MAX_BYTES,
+            DT_WEBCAM_HTTP_TIMEOUT_MS
+        );
+
+    s_webcam_model.loading = false;
+
+    if (
+        err != ESP_OK ||
+        jpeg_size < 4
+    ) {
+        free(jpeg_data);
+
+        s_webcam_model.has_image = false;
+        s_webcam_model.error = true;
+
+        snprintf(
+            s_webcam_model.status_text,
+            sizeof(s_webcam_model.status_text),
+            "Snapshot fetch failed (%s).",
+            esp_err_to_name(err)
+        );
+
+        push_webcam_ui();
+
+        return err != ESP_OK ? err : ESP_ERR_INVALID_RESPONSE;
+    }
+
+    err =
+        webcam_ensure_jfif(
+            &jpeg_data,
+            &jpeg_size
+        );
+
+    if (err != ESP_OK) {
+        free(jpeg_data);
+
+        s_webcam_model.has_image = false;
+        s_webcam_model.error = true;
+
+        snprintf(
+            s_webcam_model.status_text,
+            sizeof(s_webcam_model.status_text),
+            "Snapshot is not a usable JPEG."
+        );
+
+        push_webcam_ui();
+
+        return err;
+    }
+
+    free(s_webcam_jpeg_data);
+    s_webcam_jpeg_data = jpeg_data;
+
+    s_webcam_model.jpeg_data = s_webcam_jpeg_data;
+    s_webcam_model.jpeg_size = (uint32_t)jpeg_size;
+
+    /* DT_WEBCAM_REVISION: new bytes, so the UI must decode them. */
+    s_webcam_model.revision++;
+    s_webcam_model.has_image = true;
+    s_webcam_model.error = false;
+    s_webcam_model.status_text[0] = '\0';
+
+    push_webcam_ui();
+
+    return ESP_OK;
 }
 
 
@@ -2197,6 +3855,48 @@ static esp_err_t execute_afc_lane_request(
         );
         break;
 
+    case DT_UI_FILAMENT_REQUEST_UNLOAD_LANE: {
+        /* DT_AFC_UNLOAD_LOADED_LANE */
+        if (
+            request->lane_number <= 0 ||
+            !s_filament_model->afc_actions_enabled ||
+            !s_filament_model->has_afc_tool_unload
+        ) {
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        const dt_ui_afc_lane_t *selected = NULL;
+
+        for (
+            size_t i = 0;
+            i < s_filament_model->afc_lane_count;
+            ++i
+        ) {
+            if (
+                s_filament_model->afc_lanes[i].lane_number ==
+                request->lane_number
+            ) {
+                selected =
+                    &s_filament_model->afc_lanes[i];
+                break;
+            }
+        }
+
+        if (
+            selected == NULL ||
+            !selected->tool_loaded
+        ) {
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        snprintf(
+            script,
+            sizeof(script),
+            "TOOL_UNLOAD"
+        );
+        break;
+    }
+
     default:
         return ESP_ERR_NOT_SUPPORTED;
     }
@@ -2431,6 +4131,7 @@ static bool query_status(
     snap->nozzle_target_c = NAN;
     snap->bed_c = NAN;
     snap->bed_target_c = NAN;
+    snap->chamber_c = NAN;
     snap->fan_percent = 255;
 
     snprintf(
@@ -2453,6 +4154,8 @@ static bool query_status(
             "virtual_sdcard=progress,is_active&"
             "extruder=temperature,target,can_extrude&"
             "heater_bed=temperature,target&"
+            "temperature_sensor%20" DT_PROFILE_CHAMBER_SENSOR
+            "=temperature&"
             "fan=speed&"
             "toolhead=position,homed_axes",
             NULL,
@@ -2516,17 +4219,125 @@ static bool query_status(
             "state"
         );
 
+    const char *web_state_text =
+        cJSON_IsString(web_state)
+            ? web_state->valuestring
+            : "";
+
     const bool ready =
-        cJSON_IsString(web_state) &&
-        strcmp(
-            web_state->valuestring,
-            "ready"
-        ) == 0;
+        strcmp(web_state_text, "ready") == 0;
+
+    /*
+     * DT_KLIPPER_ERROR
+     *
+     * Klipper's webhooks states are ready / startup / shutdown / error.
+     * Only startup is genuinely "connecting"; the other two mean it has
+     * stopped and will not recover on its own.
+     */
+    const bool halted =
+        strcmp(web_state_text, "error") == 0 ||
+        strcmp(web_state_text, "shutdown") == 0;
 
     snap->connection =
         ready
             ? DT_UI_CONNECTION_ONLINE
-            : DT_UI_CONNECTION_CONNECTING;
+            : (halted
+                ? DT_UI_CONNECTION_ERROR
+                : DT_UI_CONNECTION_CONNECTING);
+
+    snap->status_message[0] = '\0';
+
+    if (halted) {
+        const cJSON *web_message =
+            cJSON_GetObjectItemCaseSensitive(
+                webhooks,
+                "message"
+            );
+
+        if (
+            cJSON_IsString(web_message) &&
+            web_message->valuestring != NULL &&
+            web_message->valuestring[0] != '\0'
+        ) {
+            snprintf(
+                snap->status_message,
+                sizeof(snap->status_message),
+                "%s",
+                web_message->valuestring
+            );
+        } else {
+            /*
+             * webhooks.message is often null even when halted -- a config
+             * parse failure, for instance, only shows up in
+             * /printer/info.state_message. Fetch that, but only while
+             * halted, so the normal poll stays one request.
+             */
+            char *info = NULL;
+
+            if (
+                http_request(
+                    HTTP_METHOD_GET,
+                    "/printer/info",
+                    NULL,
+                    &info,
+                    NULL
+                ) == ESP_OK &&
+                info != NULL
+            ) {
+                cJSON *info_root = cJSON_Parse(info);
+
+                if (info_root != NULL) {
+                    const cJSON *info_payload =
+                        moonraker_payload(info_root);
+
+                    const cJSON *state_message =
+                        cJSON_GetObjectItemCaseSensitive(
+                            info_payload,
+                            "state_message"
+                        );
+
+                    if (
+                        cJSON_IsString(state_message) &&
+                        state_message->valuestring != NULL
+                    ) {
+                        snprintf(
+                            snap->status_message,
+                            sizeof(snap->status_message),
+                            "%s",
+                            state_message->valuestring
+                        );
+                    }
+
+                    cJSON_Delete(info_root);
+                }
+            }
+
+            free(info);
+        }
+
+        /*
+         * Klipper's message is multi-line; the card's detail label is a
+         * single line with ellipsis, so fold it flat rather than letting
+         * embedded newlines render as gaps.
+         */
+        size_t w = 0;
+
+        for (size_t r = 0; snap->status_message[r] != '\0'; ++r) {
+            char ch = snap->status_message[r];
+
+            if (ch == '\n' || ch == '\r') {
+                if (w == 0 || snap->status_message[w - 1] == ' ') {
+                    continue;
+                }
+
+                ch = ' ';
+            }
+
+            snap->status_message[w++] = ch;
+        }
+
+        snap->status_message[w] = '\0';
+    }
 
     cJSON *print_stats =
         cJSON_GetObjectItemCaseSensitive(
@@ -2692,6 +4503,24 @@ static bool query_status(
         &snap->bed_target_c
     );
 
+    /*
+     * DT_CHAMBER_TEMP
+     *
+     * Klipper reports this object under its full configured name, spaces
+     * and all -- the same string used in the query above.
+     */
+    cJSON *chamber =
+        cJSON_GetObjectItemCaseSensitive(
+            status,
+            "temperature_sensor " DT_PROFILE_CHAMBER_SENSOR
+        );
+
+    json_number(
+        chamber,
+        "temperature",
+        &snap->chamber_c
+    );
+
     cJSON *fan =
         cJSON_GetObjectItemCaseSensitive(
             status,
@@ -2838,11 +4667,17 @@ static bool snapshot_equal(
 {
     return
         a->connection == b->connection &&
+        strcmp(
+            a->status_message,
+            b->status_message
+        ) == 0 &&
         a->job == b->job &&
         a->progress_percent ==
             b->progress_percent &&
         a->fan_percent ==
             b->fan_percent &&
+        a->aux_fan_revision ==
+            b->aux_fan_revision &&
         a->elapsed_seconds ==
             b->elapsed_seconds &&
         a->remaining_seconds ==
@@ -2862,6 +4697,10 @@ static bool snapshot_equal(
         runtime_float_equal(
             a->bed_target_c,
             b->bed_target_c
+        ) &&
+        runtime_float_equal(
+            a->chamber_c,
+            b->chamber_c
         ) &&
         runtime_float_equal(
             a->x,
@@ -2941,6 +4780,13 @@ static void push_ui(
         .bed_target_c =
             snap->bed_target_c,
 
+        .chamber_c =
+            snap->chamber_c,
+
+        /* DT_KLIPPER_ERROR */
+        .status_message =
+            snap->status_message,
+
         .fan_percent =
             snap->fan_percent,
 
@@ -2985,6 +4831,34 @@ static void push_ui(
         .can_fan = online,
     };
 
+    model.aux_fan_count =
+        s_aux_fan_count;
+
+    if (
+        model.aux_fan_count >
+        DT_UI_AUX_FAN_MAX
+    ) {
+        model.aux_fan_count =
+            DT_UI_AUX_FAN_MAX;
+    }
+
+    for (
+        size_t i = 0;
+        i < model.aux_fan_count;
+        ++i
+    ) {
+        model.aux_fans[i].name =
+            s_aux_fans[i].display_name;
+        model.aux_fans[i].kind =
+            s_aux_fans[i].kind;
+        model.aux_fans[i].percent =
+            s_aux_fans[i].percent;
+        model.aux_fans[i].speed_known =
+            s_aux_fans[i].speed_known;
+        model.aux_fans[i].controllable =
+            s_aux_fans[i].controllable;
+    }
+
     if (!lvgl_port_lock(100)) {
         ESP_LOGW(
             TAG,
@@ -3010,17 +4884,165 @@ static void push_ui(
 }
 
 
+/*
+ * DT_TOAST
+ *
+ * Every command the user can trigger goes through run_gcode() or
+ * post_endpoint(), and nothing on the polling path does -- so raising the
+ * toast here covers the lot without labelling 24 call sites, and can't fire
+ * on background traffic.
+ */
+static void runtime_toast(
+    dt_ui_toast_kind_t kind,
+    const char *text
+)
+{
+    if (lvgl_port_lock(200)) {
+        dt_ui_toast(kind, text);
+        lvgl_port_unlock();
+    }
+}
+
+
+/*
+ * Squash a multi-line script onto one line for display. "G91\nG1 X10
+ * F6000\nG90" is three statements the user thinks of as one move.
+ */
+/*
+ * DT_TOAST_RUNNING
+ *
+ * Moonraker's /printer/gcode/script does not answer until the gcode has
+ * FINISHED, and DT_HTTP_TIMEOUT_MS is 3.5s -- so anything slow (G28,
+ * Z_TILT_ADJUST, QUAD_GANTRY_LEVEL, BED_MESH_CALIBRATE) times out on the
+ * client side while Klipper is still happily working. That is not a
+ * failure: the request was delivered, we simply stopped waiting for the
+ * result. Reporting it as an error is worse than saying nothing, because
+ * the printer visibly does the thing while the screen claims it failed.
+ */
+static bool command_still_running(esp_err_t err)
+{
+    return
+        err == ESP_ERR_HTTP_EAGAIN ||
+        err == ESP_ERR_TIMEOUT;
+}
+
+
+static void toast_summarize(
+    const char *script,
+    char *out,
+    size_t length
+)
+{
+    size_t w = 0;
+
+    for (
+        const char *p = script;
+        *p != '\0' && w + 1 < length;
+        ++p
+    ) {
+        char ch = *p;
+
+        if (ch == '\n' || ch == '\r') {
+            /* Collapse runs of newlines into a single separator. */
+            if (w == 0 || out[w - 1] == ' ') {
+                continue;
+            }
+
+            ch = ' ';
+        }
+
+        out[w++] = ch;
+    }
+
+    out[w] = '\0';
+}
+
+
+/*
+ * Moonraker answers a rejected command with
+ * {"error": {"code": 400, "message": "..."}}. Fall back to the transport
+ * error when the body is missing or shaped differently -- an unhelpful
+ * message is still better than a silent failure.
+ */
+static void toast_failure_reason(
+    const char *response,
+    esp_err_t err,
+    char *out,
+    size_t length
+)
+{
+    if (response != NULL) {
+        cJSON *root = cJSON_Parse(response);
+
+        if (root != NULL) {
+            cJSON *error =
+                cJSON_GetObjectItemCaseSensitive(root, "error");
+
+            cJSON *message =
+                cJSON_IsObject(error)
+                    ? cJSON_GetObjectItemCaseSensitive(error, "message")
+                    : cJSON_GetObjectItemCaseSensitive(root, "message");
+
+            if (
+                cJSON_IsString(message) &&
+                message->valuestring != NULL &&
+                message->valuestring[0] != '\0'
+            ) {
+                snprintf(out, length, "%s", message->valuestring);
+                cJSON_Delete(root);
+                return;
+            }
+
+            cJSON_Delete(root);
+        }
+    }
+
+    snprintf(out, length, "%s", esp_err_to_name(err));
+}
+
+
 static esp_err_t post_endpoint(
     const char *path
 )
 {
-    return http_request(
-        HTTP_METHOD_POST,
-        path,
-        NULL,
-        NULL,
-        NULL
-    );
+    char *response = NULL;
+
+    esp_err_t err =
+        http_request(
+            HTTP_METHOD_POST,
+            path,
+            NULL,
+            &response,
+            NULL
+        );
+
+    /* DT_TOAST: the endpoint name is what the user pressed, near enough. */
+    if (err == ESP_OK) {
+        runtime_toast(DT_UI_TOAST_SUCCESS, path);
+    } else if (command_still_running(err)) {
+        char line[160];
+
+        snprintf(
+            line,
+            sizeof(line),
+            "%s - running",
+            path
+        );
+
+        runtime_toast(DT_UI_TOAST_INFO, line);
+    } else {
+        char reason[96];
+        toast_failure_reason(response, err, reason, sizeof(reason));
+
+        char line[160];
+        snprintf(line, sizeof(line), "%s: %s", path, reason);
+
+        runtime_toast(DT_UI_TOAST_ERROR, line);
+    }
+
+    free(response);
+
+    return err;
 }
 
 
@@ -3050,16 +5072,46 @@ static esp_err_t run_gcode(
         return ESP_ERR_NO_MEM;
     }
 
+    char *response = NULL;
+
     esp_err_t err =
         http_request(
             HTTP_METHOD_POST,
             "/printer/gcode/script",
             body,
-            NULL,
+            &response,
             NULL
         );
 
     cJSON_free(body);
+
+    char summary[56];
+    toast_summarize(script, summary, sizeof(summary));
+
+    if (err == ESP_OK) {
+        runtime_toast(DT_UI_TOAST_SUCCESS, summary);
+    } else if (command_still_running(err)) {
+        char line[160];
+
+        snprintf(
+            line,
+            sizeof(line),
+            "%s - running",
+            summary
+        );
+
+        runtime_toast(DT_UI_TOAST_INFO, line);
+    } else {
+        char reason[96];
+        toast_failure_reason(response, err, reason, sizeof(reason));
+
+        char line[160];
+        snprintf(line, sizeof(line), "%s: %s", summary, reason);
+
+        runtime_toast(DT_UI_TOAST_ERROR, line);
+    }
+
+    free(response);
 
     return err;
 }
@@ -3168,6 +5220,13 @@ static esp_err_t execute_action(
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (
+        action >= DT_UI_ACTION_AUX_FAN_BASE &&
+        action <= DT_UI_ACTION_AUX_FAN_LAST
+    ) {
+        return execute_aux_fan_action(action);
+    }
+
     switch (action) {
     case DT_UI_ACTION_PAUSE:
         return post_endpoint(
@@ -3187,58 +5246,14 @@ static esp_err_t execute_action(
     case DT_UI_ACTION_HOME_ALL:
         return run_gcode("G28");
 
-    case DT_UI_ACTION_JOG_X_NEG:
-        return run_gcode(
-            "G91\n"
-            "G1 X-10 F6000\n"
-            "G90"
-        );
-
-    case DT_UI_ACTION_JOG_X_POS:
-        return run_gcode(
-            "G91\n"
-            "G1 X10 F6000\n"
-            "G90"
-        );
-
-    case DT_UI_ACTION_JOG_Y_NEG:
-        return run_gcode(
-            "G91\n"
-            "G1 Y-10 F6000\n"
-            "G90"
-        );
-
-    case DT_UI_ACTION_JOG_Y_POS:
-        return run_gcode(
-            "G91\n"
-            "G1 Y10 F6000\n"
-            "G90"
-        );
-
-    case DT_UI_ACTION_JOG_Z_NEG:
-        return run_gcode(
-            "G91\n"
-            "G1 Z-1 F600\n"
-            "G90"
-        );
-
-    case DT_UI_ACTION_JOG_Z_POS:
-        return run_gcode(
-            "G91\n"
-            "G1 Z1 F600\n"
-            "G90"
-        );
+    /* DT_Z_TILT: native [z_tilt] command, not the config's Z_TILT macro */
+    case DT_UI_ACTION_Z_TILT:
+        return run_gcode(DT_PROFILE_LEVEL_GCODE);
 
     case DT_UI_ACTION_NOZZLE_220:
         return run_gcode(
             "SET_HEATER_TEMPERATURE "
             "HEATER=extruder TARGET=220"
-        );
-
-    case DT_UI_ACTION_BED_OFF:
-        return run_gcode(
-            "SET_HEATER_TEMPERATURE "
-            "HEATER=heater_bed TARGET=0"
         );
 
     case DT_UI_ACTION_BED_60:
@@ -3247,10 +5262,10 @@ static esp_err_t execute_action(
             "HEATER=heater_bed TARGET=60"
         );
 
-    case DT_UI_ACTION_BED_100:
+    case DT_UI_ACTION_BED_110:
         return run_gcode(
             "SET_HEATER_TEMPERATURE "
-            "HEATER=heater_bed TARGET=100"
+            "HEATER=heater_bed TARGET=110"
         );
 
     case DT_UI_ACTION_EXTRUDE_10:
@@ -3302,6 +5317,33 @@ static esp_err_t execute_action(
 
     case DT_UI_ACTION_SYSTEM_FACTORY_RESET:
         return dt_portal_factory_reset_from_ui();
+
+    /* Home-page quick-access macros; see dt_printer_profile.h */
+    case DT_UI_ACTION_QUICK_MACRO_1:
+        return run_gcode(DT_PROFILE_QUICK1_GCODE);
+
+    case DT_UI_ACTION_QUICK_MACRO_2:
+        return run_gcode(DT_PROFILE_QUICK2_GCODE);
+
+    /* DT_WEBCAM_SNAPSHOT */
+    case DT_UI_ACTION_WEBCAM_REFRESH:
+        return webcam_refresh();
+
+    /*
+     * DT_ESTOP
+     *
+     * Moonraker's own endpoint rather than an M112 through the gcode
+     * queue -- it shuts Klipper down immediately instead of waiting for
+     * the queue to drain.
+     */
+    case DT_UI_ACTION_EMERGENCY_STOP:
+        return http_request(
+            HTTP_METHOD_POST,
+            "/printer/emergency_stop",
+            NULL,
+            NULL,
+            NULL
+        );
 
     default:
         return ESP_ERR_NOT_SUPPORTED;
@@ -3415,6 +5457,377 @@ static void ui_filament_request_handler(
 }
 
 
+/*
+ * DT_TEMP_ENTRY
+ */
+static void ui_temperature_request_handler(
+    dt_ui_heater_t heater,
+    int celsius,
+    void *ctx
+)
+{
+    (void)ctx;
+
+    if (s_temperature_queue == NULL) {
+        return;
+    }
+
+    dt_runtime_temperature_request_t message = {
+        .heater = heater,
+        .celsius = celsius,
+    };
+
+    if (
+        xQueueSend(
+            s_temperature_queue,
+            &message,
+            0
+        ) != pdTRUE
+    ) {
+        ESP_LOGW(
+            TAG,
+            "temperature queue full; dropping heater %d target %d",
+            (int)heater,
+            celsius
+        );
+    }
+}
+
+
+static esp_err_t execute_temperature_request(
+    const dt_runtime_temperature_request_t *request
+)
+{
+    char script[96];
+
+    snprintf(
+        script,
+        sizeof(script),
+        "SET_HEATER_TEMPERATURE HEATER=%s TARGET=%d",
+        request->heater == DT_UI_HEATER_BED
+            ? "heater_bed"
+            : "extruder",
+        request->celsius
+    );
+
+    return run_gcode(script);
+}
+
+
+/*
+ * DT_PRINTER_LIST
+ */
+static void push_printer_ui(void)
+{
+    dt_printer_list_t list;
+
+    if (dt_printers_load(&list) != ESP_OK) {
+        return;
+    }
+
+    char active[DT_PRINTER_HOST_MAX] = {0};
+
+    (void)dt_printers_active_host(
+        active,
+        sizeof(active)
+    );
+
+    dt_ui_printer_model_t model = {0};
+
+    model.count =
+        list.count > DT_UI_PRINTER_MAX
+            ? DT_UI_PRINTER_MAX
+            : list.count;
+
+    model.full = list.count >= DT_PRINTER_MAX;
+
+    for (size_t i = 0; i < model.count; ++i) {
+        snprintf(
+            model.entries[i].host,
+            sizeof(model.entries[i].host),
+            "%s",
+            list.entries[i].host
+        );
+
+        model.entries[i].port = list.entries[i].port;
+
+        model.entries[i].active =
+            active[0] != '\0' &&
+            strcmp(active, list.entries[i].host) == 0;
+    }
+
+    if (lvgl_port_lock(200)) {
+        dt_ui_update_printers(&model);
+        lvgl_port_unlock();
+    }
+}
+
+
+/*
+ * DT_PRINTER_REBIND
+ *
+ * Re-point the runtime at a different Moonraker without restarting. Runs on
+ * the runtime task, never the LVGL task: discovery makes several blocking
+ * HTTP calls and would stall the UI for seconds.
+ */
+static void runtime_rebind(void)
+{
+    ESP_LOGW(TAG, "rebinding to the selected printer");
+
+    load_moonraker_config();
+
+    /*
+     * Detach runtime-owned buffers from the models and PUSH that before
+     * freeing them. LVGL draws straight out of these allocations, so
+     * releasing one while it is still the widget's source is a use-after-free
+     * -- the same ordering files_load_thumbnail() already observes.
+     */
+    uint8_t *old_thumbnail = NULL;
+
+    if (s_files_model != NULL) {
+        old_thumbnail = s_file_thumbnail_data;
+
+        s_file_thumbnail_data = NULL;
+        s_files_model->thumbnail_data = NULL;
+        s_files_model->thumbnail_size = 0;
+        s_files_model->thumbnail_width = 0;
+        s_files_model->thumbnail_height = 0;
+        s_files_model->entry_count = 0;
+        s_files_model->selected = false;
+        s_files_model->selected_name[0] = '\0';
+        s_files_model->selected_path[0] = '\0';
+        s_files_model->has_previous = false;
+
+        /*
+         * Back to the root, NOT blank. "gcodes" is seeded once when the
+         * model is allocated and never re-seeded, so clearing it here left
+         * files_refresh_directory() asking Moonraker for an empty path --
+         * which it rejects, and the file list stays empty for good.
+         */
+        snprintf(
+            s_files_model->directory,
+            sizeof(s_files_model->directory),
+            "gcodes"
+        );
+    }
+
+    if (push_files_ui_blocking()) {
+        free(old_thumbnail);
+    }
+
+    uint8_t *old_jpeg = s_webcam_jpeg_data;
+
+    s_webcam_jpeg_data = NULL;
+    s_webcam_model.jpeg_data = NULL;
+    s_webcam_model.jpeg_size = 0;
+    s_webcam_model.has_image = false;
+    s_webcam_model.configured = false;
+    s_webcam_model.error = false;
+    s_webcam_model.loading = false;
+    s_webcam_model.status_text[0] = '\0';
+    s_webcam_model.name[0] = '\0';
+    s_webcam_snapshot_url[0] = '\0';
+
+    /*
+     * revision is deliberately NOT reset: it only ever has to differ from
+     * what the UI last decoded, and leaving it monotonic avoids handing back
+     * a value the UI has already seen.
+     */
+    if (push_webcam_ui_blocking()) {
+        free(old_jpeg);
+    }
+
+    /*
+     * Wipe the change-detection snapshot so the next poll publishes whatever
+     * it finds, rather than comparing the new printer against the old one's
+     * readings and deciding nothing changed.
+     */
+    memset(&s_previous, 0, sizeof(s_previous));
+
+    /*
+     * These are already re-entrant -- discover_filament_capabilities() zeroes
+     * s_afc_lane_object_count and the has_* flags, discover_aux_fans() is on
+     * a periodic timer anyway -- so re-running them is all that rebinding
+     * needs.
+     */
+    if (s_files_model != NULL) {
+        (void)files_refresh_directory();
+    }
+
+    if (s_filament_model != NULL) {
+        (void)discover_filament_capabilities();
+        (void)discover_aux_fans();
+    }
+
+    push_printer_ui();
+
+    ESP_LOGI(TAG, "rebind complete");
+}
+
+
+static void ui_printer_request_handler(
+    dt_ui_printer_request_t request,
+    int index,
+    const char *host,
+    uint16_t port,
+    const char *api_key,
+    void *ctx
+)
+{
+    (void)ctx;
+
+    if (request == DT_UI_PRINTER_REQUEST_ADD) {
+        esp_err_t err =
+            dt_printers_add(host, port, api_key);
+
+        if (err != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "could not remember printer %s: %s",
+                host != NULL ? host : "(null)",
+                esp_err_to_name(err)
+            );
+        }
+
+        push_printer_ui();
+        return;
+    }
+
+    if (index < 0) {
+        return;
+    }
+
+    if (request == DT_UI_PRINTER_REQUEST_REMOVE) {
+        esp_err_t err =
+            dt_printers_remove((size_t)index);
+
+        if (err != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "could not forget printer %d: %s",
+                index,
+                esp_err_to_name(err)
+            );
+        }
+
+        push_printer_ui();
+        return;
+    }
+
+    esp_err_t err =
+        dt_printers_apply((size_t)index);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "could not apply printer %d: %s",
+            index,
+            esp_err_to_name(err)
+        );
+
+        push_printer_ui();
+        return;
+    }
+
+    /*
+     * DT_PRINTER_REBIND
+     *
+     * Hand the work to the runtime task rather than doing it here: this runs
+     * on the LVGL task, and rebinding blocks on several HTTP round trips.
+     */
+    push_printer_ui();
+
+    s_rebind_requested = true;
+}
+
+
+/*
+ * DT_MOVE_STEP
+ */
+static void ui_move_request_handler(
+    dt_ui_move_axis_t axis,
+    int delta_mm,
+    int speed_mms,
+    void *ctx
+)
+{
+    (void)ctx;
+
+    if (s_move_queue == NULL) {
+        return;
+    }
+
+    dt_runtime_move_request_t message = {
+        .axis = axis,
+        .delta_mm = delta_mm,
+        .speed_mms = speed_mms,
+    };
+
+    if (
+        xQueueSend(
+            s_move_queue,
+            &message,
+            0
+        ) != pdTRUE
+    ) {
+        ESP_LOGW(
+            TAG,
+            "move queue full; dropping axis %d delta %d",
+            (int)axis,
+            delta_mm
+        );
+    }
+}
+
+
+static esp_err_t execute_move_request(
+    const dt_runtime_move_request_t *request
+)
+{
+    char script[96];
+
+    if (request->axis == DT_UI_MOVE_AXIS_E) {
+        snprintf(
+            script,
+            sizeof(script),
+            "M83\n"
+            "G1 E%d F%d",
+            request->delta_mm,
+            request->speed_mms > 0
+                ? request->speed_mms * 60
+                : 300
+        );
+    } else {
+        const char axis =
+            request->axis == DT_UI_MOVE_AXIS_X ? 'X' :
+            request->axis == DT_UI_MOVE_AXIS_Y ? 'Y' : 'Z';
+
+        /* Same feedrates the old fixed-step jog buttons used. */
+        int feed =
+            request->axis == DT_UI_MOVE_AXIS_Z
+                ? 600
+                : 6000;
+
+        if (request->speed_mms > 0) {
+            feed = request->speed_mms * 60;
+        }
+
+        snprintf(
+            script,
+            sizeof(script),
+            "G91\n"
+            "G1 %c%d F%d\n"
+            "G90",
+            axis,
+            request->delta_mm,
+            feed
+        );
+    }
+
+    return run_gcode(script);
+}
+
+
 static void runtime_task(void *arg)
 {
     (void)arg;
@@ -3439,6 +5852,7 @@ static void runtime_task(void *arg)
 
     if (s_filament_model != NULL) {
         (void)discover_filament_capabilities();
+                    (void)discover_aux_fans();
     }
 
     TickType_t last_capability_check =
@@ -3448,12 +5862,74 @@ static void runtime_task(void *arg)
         xTaskGetTickCount() -
         pdMS_TO_TICKS(DT_AFC_STATUS_PERIOD_MS);
 
+    TickType_t last_aux_fan_status =
+        xTaskGetTickCount() -
+        pdMS_TO_TICKS(2000);
+
     push_system_ui();
 
     TickType_t last_system_update =
         xTaskGetTickCount();
 
     for (;;) {
+        /* DT_PRINTER_REBIND */
+        if (s_rebind_requested) {
+            s_rebind_requested = false;
+            runtime_rebind();
+        }
+
+        /* DT_MOVE_STEP */
+        dt_runtime_move_request_t move_request;
+
+        while (
+            s_move_queue != NULL &&
+            xQueueReceive(
+                s_move_queue,
+                &move_request,
+                0
+            ) == pdTRUE
+        ) {
+            esp_err_t move_err =
+                execute_move_request(&move_request);
+
+            if (move_err != ESP_OK) {
+                ESP_LOGW(
+                    TAG,
+                    "move request axis %d delta %d failed: %s",
+                    (int)move_request.axis,
+                    move_request.delta_mm,
+                    esp_err_to_name(move_err)
+                );
+            }
+        }
+
+        /* DT_TEMP_ENTRY */
+        dt_runtime_temperature_request_t temperature_request;
+
+        while (
+            s_temperature_queue != NULL &&
+            xQueueReceive(
+                s_temperature_queue,
+                &temperature_request,
+                0
+            ) == pdTRUE
+        ) {
+            esp_err_t temperature_err =
+                execute_temperature_request(
+                    &temperature_request
+                );
+
+            if (temperature_err != ESP_OK) {
+                ESP_LOGW(
+                    TAG,
+                    "temperature request heater %d target %d failed: %s",
+                    (int)temperature_request.heater,
+                    temperature_request.celsius,
+                    esp_err_to_name(temperature_err)
+                );
+            }
+        }
+
         dt_runtime_filament_request_t filament_request;
 
         while (
@@ -3524,7 +6000,21 @@ static void runtime_task(void *arg)
             esp_err_t err =
                 execute_action(action);
 
-            if (err != ESP_OK) {
+            if (err != ESP_OK && command_still_running(err)) {
+                /*
+                 * DT_TOAST_RUNNING
+                 *
+                 * Not an error: Klipper is still executing. Logged at
+                 * warning so a slow command is still visible on the wire,
+                 * but no longer indistinguishable from a rejection.
+                 */
+                ESP_LOGW(
+                    TAG,
+                    "UI action %d still running at timeout (%s)",
+                    (int)action,
+                    esp_err_to_name(err)
+                );
+            } else if (err != ESP_OK) {
                 ESP_LOGE(
                     TAG,
                     "UI action %d failed: %s",
@@ -3574,12 +6064,33 @@ static void runtime_task(void *arg)
                     );
 
                     (void)discover_filament_capabilities();
+                    (void)discover_aux_fans();
                 }
 
                 ever_online = true;
             }
 
             previous_online = online;
+
+            if (
+                online &&
+                s_aux_fan_count > 0 &&
+                now - last_aux_fan_status >=
+                    pdMS_TO_TICKS(2000)
+            ) {
+                last_aux_fan_status = now;
+                (void)query_aux_fan_status();
+            } else if (!online) {
+                aux_fans_mark_offline();
+            }
+
+            /*
+             * query_status() zero-initializes the snapshot. Inject the current
+             * auxiliary-fan generation after its independent status poll so a
+             * fan-only change still reaches dt_ui_update().
+             */
+            snap.aux_fan_revision =
+                s_aux_fan_revision;
 
             if (s_files_model != NULL) {
                 const bool files_was_online =
@@ -3619,6 +6130,28 @@ static void runtime_task(void *arg)
                 push_filament_ui();
             }
 
+            /* DT_WEBCAM_SNAPSHOT */
+            if (s_webcam_model.online != online) {
+                s_webcam_model.online = online;
+                push_webcam_ui();
+
+                /*
+                 * DT_WEBCAM_HOME_PANE
+                 *
+                 * The home page carries a webcam pane and is resident from
+                 * boot, so it can't rely on a page-entry refresh the way the
+                 * webcam page does. Pull the first frame as soon as the
+                 * printer becomes reachable instead.
+                 */
+                if (
+                    online &&
+                    !s_webcam_model.has_image &&
+                    !s_webcam_model.loading
+                ) {
+                    webcam_refresh();
+                }
+            }
+
 
             if (
                 online &&
@@ -3636,20 +6169,32 @@ static void runtime_task(void *arg)
                 );
             }
 
-            if (online) {
-                failure_count = 0;
-            } else {
+            /*
+             * DT_KLIPPER_ERROR
+             *
+             * Only a genuine transport failure counts as unreachable. A
+             * halted Klipper still has Moonraker answering every request,
+             * so counting it here logged "status unavailable" about a
+             * server that was replying perfectly well.
+             */
+            if (
+                snap.connection ==
+                DT_UI_CONNECTION_OFFLINE
+            ) {
                 failure_count++;
+
                 if (
                     failure_count == 1 ||
                     failure_count % 30 == 0
                 ) {
                     ESP_LOGW(
                         TAG,
-                        "Moonraker status unavailable (attempt %u)",
+                        "Moonraker unreachable (attempt %u)",
                         failure_count
                     );
                 }
+            } else {
+                failure_count = 0;
             }
 
             if (
@@ -3693,6 +6238,7 @@ static void runtime_task(void *arg)
                 s_base_url[0] != '\0'
             ) {
                 (void)discover_filament_capabilities();
+                    (void)discover_aux_fans();
 
                 if (
                     s_filament_model->afc_detected
@@ -3766,11 +6312,9 @@ esp_err_t dt_runtime_network_start(void)
         );
     }
 
-    runtime_heap_diag("early-before-wifi");
 
     err = dc_wifi_start();
 
-    runtime_heap_diag("early-after-wifi");
 
     if (err != ESP_OK) {
         ESP_LOGE(
@@ -3787,12 +6331,9 @@ esp_err_t dt_runtime_network_start(void)
         WIFI_PS_NONE
     );
 
-    runtime_heap_diag("moonraker-client-skipped");
-    runtime_heap_diag("early-before-portal");
 
     err = dt_portal_start();
 
-    runtime_heap_diag("early-after-portal");
 
     if (err != ESP_OK) {
         ESP_LOGE(
@@ -3814,6 +6355,15 @@ esp_err_t dt_runtime_start(void)
 {
     load_moonraker_config();
 
+    /*
+     * DT_PRINTER_LIST
+     *
+     * Fold whatever is already configured into the list so the printer in
+     * use shows up without being re-entered.
+     */
+    (void)dt_printers_sync_active();
+    push_printer_ui();
+
     esp_err_t err =
         dt_runtime_network_start();
 
@@ -3826,7 +6376,6 @@ esp_err_t dt_runtime_start(void)
         );
     }
 
-    runtime_heap_diag("network-phase-complete");
 
     s_files_model =
         heap_caps_calloc(
@@ -3859,6 +6408,18 @@ esp_err_t dt_runtime_start(void)
     s_filament_model->nozzle_c = NAN;
     s_filament_model->nozzle_target_c = NAN;
 
+    s_aux_fans =
+        heap_caps_calloc(
+            DT_UI_AUX_FAN_MAX,
+            sizeof(*s_aux_fans),
+            MALLOC_CAP_SPIRAM |
+                MALLOC_CAP_8BIT
+        );
+
+    if (s_aux_fans == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
     s_file_queue =
         xQueueCreate(
             DT_FILE_QUEUE_LEN,
@@ -3877,6 +6438,28 @@ esp_err_t dt_runtime_start(void)
         );
 
     if (s_filament_queue == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* DT_TEMP_ENTRY */
+    s_temperature_queue =
+        xQueueCreate(
+            DT_TEMPERATURE_QUEUE_LEN,
+            sizeof(dt_runtime_temperature_request_t)
+        );
+
+    if (s_temperature_queue == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* DT_MOVE_STEP */
+    s_move_queue =
+        xQueueCreate(
+            DT_MOVE_QUEUE_LEN,
+            sizeof(dt_runtime_move_request_t)
+        );
+
+    if (s_move_queue == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -3912,7 +6495,30 @@ esp_err_t dt_runtime_start(void)
         )
     );
 
-    runtime_heap_diag("before-worker");
+    /* DT_TEMP_ENTRY */
+    ESP_ERROR_CHECK(
+        dt_ui_set_temperature_request_handler(
+            ui_temperature_request_handler,
+            NULL
+        )
+    );
+
+    /* DT_MOVE_STEP */
+    ESP_ERROR_CHECK(
+        dt_ui_set_move_request_handler(
+            ui_move_request_handler,
+            NULL
+        )
+    );
+
+    /* DT_PRINTER_LIST */
+    ESP_ERROR_CHECK(
+        dt_ui_set_printer_request_handler(
+            ui_printer_request_handler,
+            NULL
+        )
+    );
+
 
     /*
      * DT_RUNTIME_PSRAM_WORKER
@@ -3932,7 +6538,6 @@ esp_err_t dt_runtime_start(void)
             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
         );
 
-    runtime_heap_diag("after-worker");
 
     if (worker_created != pdPASS) {
         return ESP_ERR_NO_MEM;

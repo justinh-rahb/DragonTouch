@@ -1,4 +1,9 @@
-# Known target envelope from the K-Touch/PandaTouch reference build.
+# Target board. The Kconfig default is K-Touch/PandaTouch; this branch is the
+# Waveshare port, so select it here -- otherwise a fresh clone silently builds
+# for the wrong hardware.
+CONFIG_DT_BOARD_WAVESHARE_ESP32_S3_TOUCH_LCD_7=y
+
+# Known target envelope, shared by both supported boards.
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
@@ -43,3 +48,28 @@ CONFIG_PARTITION_TABLE_OFFSET=0x8000
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
 CONFIG_ESP_WIFI_RX_BA_WIN=4
 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+
+# DT_FILE_THUMBNAIL_PREVIEW: Moonraker/OrcaSlicer PNG previews
+CONFIG_LV_USE_LODEPNG=y
+
+# DT_WEBCAM_SNAPSHOT: webcam snapshots are JPEG, decoded via LVGL's
+# built-in TJpgDec (software decode -- the ESP32-S3 has no hardware
+# JPEG codec). Same RAW-cf/magic-sniffing decoder path as the PNG
+# thumbnails above, just a different registered decoder.
+CONFIG_LV_USE_TJPGD=y
+
+# DT_WEBCAM_SNAPSHOT: TJpgDec's LVGL binding only decodes an in-memory
+# buffer (LV_IMAGE_SRC_VARIABLE, what the snapshot uses) by wrapping it
+# as a fake file through LVGL's memory-mapped filesystem driver -- unlike
+# LodePNG, it has no direct in-memory decode path. Without this, decode
+# silently fails (decoder_info returns LV_RESULT_INVALID) and the image
+# never appears. Letter 77 = 'M', matching lv_fs_memfs.c's own default.
+CONFIG_LV_USE_FS_MEMFS=y
+CONFIG_LV_FS_MEMFS_LETTER=77
+
+# DT_LVGL_MEM_POOL_PSRAM: LVGL's lv_malloc() pool is redirected to PSRAM
+# (main/dt_lv_mem_pool.c + main/CMakeLists.txt), so this no longer costs
+# internal RAM. Was stuck at the Kconfig default (64), which was too small/
+# fragmented even for a single 48x48 PNG decode (lodepng err=83, "memory
+# allocation failed") -- grown generously now that ~6MB of PSRAM backs it.
+CONFIG_LV_MEM_SIZE_KILOBYTES=1024

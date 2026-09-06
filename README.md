@@ -1,62 +1,102 @@
 # DragonTouch
 
-DragonTouch is the touch-console member of the Dragon device family, targeting
-BIGTREETECH K-Touch and PandaTouch hardware. The first milestone is trustworthy
-native ESP-IDF board bring-up; family-device discovery and the single-pane control
-surface come after the display, touch, backlight, PSRAM, and Wi-Fi paths are proven.
+DragonTouch is the touch-console member of the Dragon device family: a native
+ESP-IDF firmware that turns an ESP32-S3 touch display into a Klipper console,
+talking to Moonraker over HTTP.
 
-This repository is deliberately groundwork only. It currently provides:
+Two boards are supported, selected in `menuconfig` under **DragonTouch
+hardware → Target board**:
 
-- an ESP-IDF 5.3 / ESP32-S3 build skeleton;
-- a clean-room hardware contract derived from publicly documented behavior;
-- a compile-time pin-collision guard for the known RGB and GT911 signals;
-- a native LVGL printer-console shell using the Dragon design language and red accent;
-- bring-up gates that prevent us from jumping straight to product UI;
-- CI that compiles the scaffold for ESP32-S3.
+- **BIGTREETECH K-Touch / PandaTouch** — the original target.
+- **Waveshare ESP32-S3-Touch-LCD-7** — 800x480 RGB565, GT911 touch, 16 MB
+  flash, 8 MB octal PSRAM. This branch defaults to it.
 
-No image in this repository is ready to flash to hardware yet. Back up a device's
-factory flash and partition table before the first HIL run. The read-only identification
-and dual-backup procedure is in [docs/GATE0-RECOVERY.md](docs/GATE0-RECOVERY.md).
+## What it does
 
-## UI preview
+- **Home** — job state, progress and time, a temperature row, quick-access
+  macros, and a live webcam pane.
+- **Control** — jog with selectable step, bed levelling, heater presets and
+  numeric entry, fan control including discovered `fan_generic` objects.
+- **Filament** — capability-aware AFC (Box Turtle) lane control: load,
+  unload, eject and recovery reset. Every action is gated on the macros the
+  printer actually reports through Moonraker, so a printer without AFC simply
+  shows the manual extruder controls.
+- **Files** — browse `gcodes`, with embedded thumbnails and metadata.
+- **Webcam** — on-demand snapshots decoded on the device.
+- **Printers** — save several Moonraker instances and switch between them
+  from the header, without restarting.
 
-![DragonTouch work-in-progress LVGL printer console](docs/assets/ui-preview.png)
+Commands report their outcome on screen, carrying Klipper's own error text
+when one is rejected.
 
-The work-in-progress interface above is rendered by the desktop SDL harness from the
-same LVGL source used by the firmware. It is an interaction and visual-design preview;
-panel, touch, backlight, networking, and machine-command integration are not enabled.
-See [docs/UI.md](docs/UI.md) for the UI contract and simulator workflow.
-
-## Build
+## Building
 
 ```sh
 idf.py set-target esp32s3
-idf.py build
+idf.py build flash monitor
 ```
 
-The expected baseline is ESP-IDF 5.3 or newer, 16 MB flash, and octal PSRAM. The reference firmware selects QIO, but the effective flash mode remains a first-hardware verification item for this native ESP-IDF project.
-See [docs/HARDWARE.md](docs/HARDWARE.md) before changing any display timing or pin.
+ESP-IDF 5.3 or newer. `sdkconfig.defaults` pins the board, flash and PSRAM
+settings, so a clean checkout builds for the right hardware without running
+`menuconfig`.
 
-## Roadmap
+### dragon-core
 
-1. Back up stock flash and record the factory partition map.
-2. Prove serial, flash, PSRAM, and a black-screen/backlight-safe boot.
-3. Prove stable RGB output under simultaneous Wi-Fi traffic.
-4. Prove GT911 touch coordinates and orientation.
-5. Connect the LVGL shell to the board display and a board-level HIL pattern.
-6. Integrate `dragon-core` Wi-Fi, discovery, and remote-device contracts.
-7. Build the same-LAN Dragon-family single-pane UI.
+DragonTouch depends on [`dragon-core`](https://github.com/justinh-rahb/dragon-core)
+for Wi-Fi, the setup portal, the Moonraker client and shared UI. `main/idf_component.yml`
+references it by relative path, so the two repositories must sit side by side:
 
-The LVGL shell is documented in [docs/UI.md](docs/UI.md). It compiles independently
-of the unfinished display driver and keeps all machine-affecting controls disabled
-until a capability-aware product adapter is connected.
+```
+projects/
+├── DragonTouch/
+└── dragon-core/
+```
+
+## Configuring for your printer
+
+Gcode macro names, the chamber sensor and the heater ceilings differ from one
+machine to the next. They live in
+[`components/dt_config/include/dt_printer_profile.h`](components/dt_config/include/dt_printer_profile.h)
+with defaults that suit a stock Klipper printer.
+
+**Do not edit that file.** Put a `dt_printer_profile_local.h` beside it
+defining only what differs:
+
+```c
+#define DT_PROFILE_LEVEL_GCODE  "QUAD_GANTRY_LEVEL"
+#define DT_PROFILE_QUICK2_LABEL "Purge Line"
+#define DT_PROFILE_QUICK2_GCODE "PURGE_LINE"
+#define DT_PROFILE_CHAMBER_SENSOR "enclosure"
+```
+
+It is picked up automatically and is gitignored, so a personal setup never
+lands in a commit. Nothing in the profile is required: a macro the printer
+does not define just fails when pressed, and the error says why.
+
+## Setup
+
+On first boot the device brings up a `DragonTouch_XXXX` access point and
+serves a setup portal. Join it to provide Wi-Fi credentials and the Moonraker
+host. A hostname is preferable to an IP — it survives DHCP changes.
+
+## Documentation
+
+- [docs/HARDWARE.md](docs/HARDWARE.md) — pin maps and display timing. Read
+  before changing either.
+- [docs/UI.md](docs/UI.md) — UI contract and the desktop LVGL simulator.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — runtime and component layout.
+- [docs/BRINGUP.md](docs/BRINGUP.md) — board bring-up gates.
+- [docs/GATE0-RECOVERY.md](docs/GATE0-RECOVERY.md) — back up a device's stock
+  flash and partition table before the first flash.
 
 ## Reference boundary
 
-PaxxTouch is GPL-3.0-labelled software and is used only as a behavioral and hardware
-reference. DragonTouch does not copy its implementation. See
-[docs/PAXXTOUCH-NOTES.md](docs/PAXXTOUCH-NOTES.md) for provenance and extracted facts.
+PaxxTouch is GPL-3.0-labelled software and is used only as a behavioral and
+hardware reference. DragonTouch does not copy its implementation. See
+[docs/PAXXTOUCH-NOTES.md](docs/PAXXTOUCH-NOTES.md) for provenance and
+extracted facts.
 
 ## License
 
-License selection is intentionally deferred until the project owners choose one.
+License selection is intentionally deferred until the project owners choose
+one.

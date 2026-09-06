@@ -7,3 +7,6 @@
 .DS_Store
 /backups/
 /activate.sh
+
+# Per-machine printer profile: see components/dt_config/include/dt_printer_profile.h
+dt_printer_profile_local.h
