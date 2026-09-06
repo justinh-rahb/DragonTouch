@@ -11,6 +11,8 @@ This repository is deliberately groundwork only. It currently provides:
 - a clean-room hardware contract derived from publicly documented behavior;
 - a compile-time pin-collision guard for the known RGB and GT911 signals;
 - a native LVGL printer-console shell using the Dragon design language and red accent;
+- a headless development console that discovers Dragon-family peers and renders
+  their read-only capability state, including DragonStatus lighting health;
 - bring-up gates that prevent us from jumping straight to product UI;
 - CI that compiles the scaffold for ESP32-S3.
 
