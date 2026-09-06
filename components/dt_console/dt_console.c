@@ -23,7 +23,20 @@ static const char *kind_str(uint8_t k)
         case DC_PEER_KIND_VENT:   return "vent";
         case DC_PEER_KIND_WHEEZE: return "wheeze";
         case DC_PEER_KIND_TOUCH:  return "touch";
+        case DC_PEER_KIND_STATUS: return "status";
         default:                  return "unknown";
+    }
+}
+
+static const char *printer_state_str(uint8_t state)
+{
+    switch (state) {
+        case DC_PEER_PRINTER_IDLE:     return "idle";
+        case DC_PEER_PRINTER_PRINTING: return "printing";
+        case DC_PEER_PRINTER_PAUSED:   return "paused";
+        case DC_PEER_PRINTER_ERROR:    return "error";
+        case DC_PEER_PRINTER_OFFLINE:  return "offline";
+        default:                       return "unknown";
     }
 }
 
@@ -70,6 +83,16 @@ static void status_summary(const dc_registry_entry_t *e, char *out, size_t n)
                      d->set_temp_c, d->set_time_h, amb, rh, (unsigned long)d->remaining_sec);
             break;
         }
+        case DC_PEER_CAP_LIGHTING: {
+            const dc_peer_lighting_t *l = &e->status.lighting;
+            snprintf(out, n, "%s  brightness %u/255  fx %u  rgb #%02x%02x%02x  %u px%s%s",
+                     printer_state_str(l->printer_state), l->brightness,
+                     l->effect, l->color[0], l->color[1], l->color[2],
+                     l->wire_pixels,
+                     (l->flags & DC_PEER_LIGHTING_STANDBY_BLANK) ? "  standby" : "",
+                     (l->flags & DC_PEER_LIGHTING_RENDERER_FAULT) ? "  FAULT" : "");
+            break;
+        }
         default:
             snprintf(out, n, "(cap %u)", e->status_cap);
             break;
@@ -99,6 +122,22 @@ static esp_err_t devices_get(httpd_req_t *req)
         cJSON_AddNumberToObject(o, "last_seen_ms_ago", (double)(now - e->last_seen_us) / 1000.0);
         char summary[96]; status_summary(e, summary, sizeof summary);
         cJSON_AddStringToObject(o, "status", summary);
+        if (e->has_status && e->status_cap == DC_PEER_CAP_LIGHTING) {
+            const dc_peer_lighting_t *l = &e->status.lighting;
+            cJSON *lighting = cJSON_AddObjectToObject(o, "lighting");
+            cJSON_AddStringToObject(lighting, "printer_state", printer_state_str(l->printer_state));
+            cJSON_AddNumberToObject(lighting, "progress", l->progress_pct);
+            cJSON_AddNumberToObject(lighting, "brightness", l->brightness);
+            cJSON_AddNumberToObject(lighting, "effect", l->effect);
+            cJSON_AddNumberToObject(lighting, "wire_pixels", l->wire_pixels);
+            cJSON_AddBoolToObject(lighting, "enabled", l->flags & DC_PEER_LIGHTING_ENABLED);
+            cJSON_AddBoolToObject(lighting, "hardware_ready", l->flags & DC_PEER_LIGHTING_HARDWARE_READY);
+            cJSON_AddBoolToObject(lighting, "renderer_fault", l->flags & DC_PEER_LIGHTING_RENDERER_FAULT);
+            cJSON_AddBoolToObject(lighting, "standby", l->flags & DC_PEER_LIGHTING_STANDBY_BLANK);
+            cJSON *color = cJSON_AddArrayToObject(lighting, "color");
+            for (size_t channel = 0; channel < 3; ++channel)
+                cJSON_AddItemToArray(color, cJSON_CreateNumber(l->color[channel]));
+        }
         cJSON_AddItemToArray(arr, o);
     }
     cJSON_AddNumberToObject(root, "count", n);
